@@ -22,7 +22,7 @@ def test_sandbox_executor_matches_local(tmp_path, monkeypatch):
     assert not remote.errors
     # base -> deps checkpoint -> trial checkpoint -> 4 branches
     assert len(fake.created) == 1 + 1 + 1 + 4
-    assert remote.summary()["chunks"] == 4
+    assert remote.summary()["branches"] == 4
     assert (tmp_path / "img").exists()      # deps image cached for next time
 
 

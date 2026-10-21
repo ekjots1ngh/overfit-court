@@ -25,7 +25,7 @@ from scipy import stats as st
 from . import stats
 from .config import Settings, get_settings
 from .ledger import Ledger
-from .library import FAMILIES, UNIVERSES, with_universe
+from .library import FISHABLE as FAMILIES, UNIVERSES, with_universe
 from .llm import LLM
 from .pipeline import (SEALED_FRAC, Judgement, SealedResult, drop_flat, judge_statistics,
                        record_key, split_sealed, unseal_strategy)

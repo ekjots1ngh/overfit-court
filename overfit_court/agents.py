@@ -12,6 +12,7 @@ import json
 import re
 
 from . import library
+from .stats import fmt_prob
 from .llm import LLM, extract_code
 
 # ---------------------------------------------------------------- planner
@@ -93,9 +94,10 @@ def write_code(llm: LLM, spec: dict, error: str | None = None, previous: str | N
     user = f"Spec:\n{json.dumps(spec, indent=2)}\n\nParameters: {list(spec['param_grid'])}"
     if error:
         user += f"\n\nYour previous code failed with:\n{error}\n\nPrevious code:\n{previous}\nFix it."
+    fam = library.FAMILIES.get(spec.get("family", library.DEFAULT), library.FAMILIES[library.DEFAULT])
+    mock_code = fam.fixed_code if (error and fam.fixed_code) else fam.code
     text = llm.chat("coder" if not error else "coder-repair", "super", CODER_SYS, user,
-                    mock=lambda: "```python\n" + library.FAMILIES[
-                        spec.get("family", library.DEFAULT)].code + "```", max_tokens=3000)
+                    mock=lambda: "```python\n" + mock_code + "```", max_tokens=3000)
     return extract_code(text)
 
 
@@ -152,7 +154,10 @@ the configurations amount to (random matrix theory), which can be far fewer
 than the number of configurations; prob_oos_loss is how often the in-sample
 winner loses money out of sample; pbo is only about whether the exact
 parameters were overfit, and a high pbo with a low prob_oos_loss means the
-parameters don't matter but the strategy family works. Reply JSON only:
+parameters don't matter but the strategy family works. time_travel reports the
+harness test that re-runs the strategy on truncated history: if it FAILED, the
+code read the future, the backtest is meaningless whatever its Sharpe, and that
+is the headline. Reply JSON only:
 {"headline": str, "reasoning": [str, str, str], "what_would_change_my_mind": [str, str]}
 Use only numbers that appear in the evidence. Be direct, no hype."""
 
@@ -160,6 +165,22 @@ Use only numbers that appear in the evidence. Be direct, no hype."""
 def judge(llm: LLM, verdict: str, evidence: dict) -> dict:
     def mock():
         e = evidence
+        if e.get("time_travel", "").startswith("FAILED"):
+            return json.dumps({
+                "headline": f"{verdict}: this strategy reads the future. Its backtest Sharpe of "
+                            f"{e['best_sharpe_annual']:.2f} is not evidence of anything.",
+                "reasoning": [
+                    e["time_travel_detail"],
+                    "A strategy can only trade on what it knew at the time. When positions on past "
+                    "dates change as later data arrives, the backtest is using tomorrow's prices.",
+                    f"{e['repairs']} repair attempt(s) did not remove the leak, so the court does not "
+                    "weigh the statistics, and the evidence room stays shut: a strategy that reads "
+                    "the future would read the sealed evidence too.",
+                ],
+                "what_would_change_my_mind": ["Rewriting every statistic as a rolling or expanding "
+                                              "window over past data only",
+                                              "Passing the time-travel test, then the sealed evidence"],
+            })
         yrs = e["years_of_live_trading_to_prove_it"]
         memory = ""
         if e["trial_number_on_this_data"] > 1:
@@ -173,7 +194,7 @@ def judge(llm: LLM, verdict: str, evidence: dict) -> dict:
                 f"{e['n_configs']} configurations were tried here, but they amount to only about "
                 f"{e['distinct_bets_this_trial']:.0f} genuinely different bets. Zero-edge versions "
                 f"of them typically reach a best Sharpe of {e['luck_sharpe_annual']:.2f}.{memory}",
-                f"After that correction the probability the edge is real is {e['p_real']:.0%}. "
+                f"After that correction the probability the edge is real is {fmt_prob(e['p_real'])}. "
                 + ("No length of live track record would confirm it, because it does not beat luck."
                    if yrs is None else f"Proving it live would take about {yrs} years."),
                 f"The in-sample winner lost money out of sample in {e['prob_oos_loss']:.0%} of "

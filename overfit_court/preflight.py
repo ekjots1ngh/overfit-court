@@ -55,6 +55,17 @@ def check_calls(s) -> None:
                  f"${c.cost_usd:.6f}, said {out[:30]!r}")
         except Exception as e:
             line(FAIL, f"{tier} call", f"{type(e).__name__}: {e}")
+    # JSON mode: if a tier rejects response_format the client falls back to asking in the
+    # prompt; worth knowing, and worth reporting in the hackathon feedback
+    for tier in ("nano", "super", "ultra"):
+        try:
+            llm.client.chat.completions.create(
+                model=s.models[tier], max_tokens=200, response_format={"type": "json_object"},
+                messages=[{"role": "user", "content": 'Reply with {"ok": true}'}])
+            line(OK, f"{tier} JSON mode accepted")
+        except Exception as e:
+            line(SKIP, f"{tier} JSON mode not accepted; the client will fall back",
+                 f"{type(e).__name__}: {str(e)[:120]}")
 
 
 async def _sandbox():

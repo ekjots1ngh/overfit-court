@@ -215,6 +215,27 @@ def verdict_from_stats(p_real: float, wf_sharpe_annual: float, prob_oos_loss: fl
     return "HUNG JURY"
 
 
+def fmt_prob(p: float) -> str:
+    """99.7% is not 100%: never round a probability to certainty."""
+    if p >= 0.995:
+        return "over 99%"
+    if p <= 0.005:
+        return "under 1%"
+    return f"{p:.0%}"
+
+
+def verdict_reasons(p_real: float, wf_sharpe_annual: float, prob_oos_loss: float) -> list[str]:
+    """Which checks failed, in plain words (empty when nothing failed outright)."""
+    out = []
+    if p_real < 0.5:
+        out.append(f"luck explains it (P(real) {p_real:.0%})")
+    if wf_sharpe_annual <= 0:
+        out.append(f"chosen walk-forward it loses money (Sharpe {wf_sharpe_annual:.2f})")
+    if prob_oos_loss >= 0.5:
+        out.append(f"the in-sample winner loses out of sample in {prob_oos_loss:.0%} of splits")
+    return out
+
+
 def min_track_record_years(sr: float, sr_benchmark: float, skew: float = 0.0,
                            kurt: float = 3.0, alpha: float = 0.05,
                            periods: int = PERIODS_PER_YEAR) -> float | None:

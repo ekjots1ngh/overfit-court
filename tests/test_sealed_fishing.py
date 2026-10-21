@@ -14,9 +14,9 @@ class SpyExecutor(InProcessExecutor):
     def __init__(self):
         self.seen = []
 
-    def run(self, code, prices, grid, cost_bps):
+    def run(self, code, prices, grid, cost_bps, leak_check=None):
         self.seen.append((prices.index.max(), len(grid)))
-        return super().run(code, prices, grid, cost_bps)
+        return super().run(code, prices, grid, cost_bps, leak_check)
 
 
 def _settings():

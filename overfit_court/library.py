@@ -19,13 +19,48 @@ class Family:
     param_grid: dict
     code: str
     search_queries: tuple = ()
+    fixed_code: str = ""        # demo mode: what a repair produces
+    fishable: bool = True       # offered to the fishing expedition
 
 
-def _f(name, title, hypothesis, keywords, grid, code, queries=()):
-    return Family(name, title, hypothesis, tuple(keywords), grid, code.strip() + "\n", tuple(queries))
+def _f(name, title, hypothesis, keywords, grid, code, queries=(), fixed="", fishable=True):
+    return Family(name, title, hypothesis, tuple(keywords), grid, code.strip() + "\n",
+                  tuple(queries), fixed.strip() + "\n" if fixed else "", fishable)
 
 
 FAMILIES = {f.name: f for f in [
+    # A plausible idea whose obvious implementation reads the future: the mean
+    # and standard deviation are taken over the whole series, including dates
+    # that have not happened yet. A code review usually misses it; the
+    # time-travel test does not. Demo mode shows the catch and the repair.
+    _f("anchor", "Reversion to the long-run average",
+       "Assets trading below their long-run average price drift back up to it.",
+       ["long-run average", "long run average", "average price", "below their average",
+        "below average", "fair value", "anchor"],
+       {"band": [0.0, 0.25, 0.5, 0.75, 1.0, 1.5], "window": [60, 120, 250, 500]},
+       '''
+import numpy as np
+import pandas as pd
+
+
+def positions(prices: pd.DataFrame, band: float = 0.5, window: int = 250) -> pd.DataFrame:
+    # how far is each asset from its long-run average price?
+    z = (prices - prices.mean()) / prices.std()
+    return (-np.sign(z)).where(z.abs() > band, 0.0)
+''', ["mean reversion to long run average price stocks", "anchoring fair value reversion"],
+       fixed='''
+import numpy as np
+import pandas as pd
+
+
+def positions(prices: pd.DataFrame, band: float = 0.5, window: int = 250) -> pd.DataFrame:
+    # long-run average and spread from PAST prices only (rolling window)
+    ma = prices.rolling(window, min_periods=window).mean()
+    sd = prices.rolling(window, min_periods=window).std()
+    z = (prices - ma) / sd
+    return (-np.sign(z)).where(z.abs() > band, 0.0).fillna(0.0)
+''', fishable=False),
+
     _f("weekday", "Day-of-week effect",
        "Returns on one weekday are systematically different from the others.",
        ["monday", "tuesday", "wednesday", "thursday", "friday", "weekday", "day of week",
@@ -167,6 +202,7 @@ def positions(prices: pd.DataFrame, lookback: int = 60, skip: int = 5,
 ]}
 
 DEFAULT = "momentum"
+FISHABLE = {k: f for k, f in FAMILIES.items() if f.fishable}
 
 
 def route(idea: str) -> Family:

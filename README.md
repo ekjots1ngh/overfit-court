@@ -140,7 +140,7 @@ python -m overfit_court fish --csv prices.csv --target 1.0 --attempts 40
 
 Real data: `pip install yfinance && python examples/fetch_prices.py sectors`.
 
-Tests: `pytest -q` (41 tests: the time-travel test against five kinds of leak and every honest strategy, sealed-evidence isolation, Reality Check calibration and duplicate invariance, distinct-bets counting, the court's memory, fishing expeditions, the sandbox executor against a fake contree client, the live client against a misbehaving fake Token Factory, and a full trial through a live-like model).
+Tests: `pytest -q` (43 tests: the app loading and running every demo act, the time-travel test against five kinds of leak and every honest strategy, sealed-evidence isolation, Reality Check calibration and duplicate invariance, distinct-bets counting, the court's memory, fishing expeditions, the sandbox executor against a fake contree client, the live client against a misbehaving fake Token Factory, and a full trial through a live-like model).
 
 Deploy: the `Dockerfile` serves the app on port 8501 (for example on Nebius Serverless Endpoints); CPU is enough.
 

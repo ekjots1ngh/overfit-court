@@ -1,0 +1,9 @@
+.git
+.env
+__pycache__
+*.pyc
+.pytest_cache
+tests
+examples
+report.*
+.overfit_court_sandbox_image

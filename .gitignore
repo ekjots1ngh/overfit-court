@@ -1,0 +1,9 @@
+.env
+__pycache__/
+*.pyc
+.pytest_cache/
+report.*
+.overfit_court_sandbox_image
+fishing_results.csv
+*.csv
+!examples/*.csv

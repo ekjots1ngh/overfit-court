@@ -1,10 +1,12 @@
+# Runtime dependencies (installed by Streamlit Community Cloud and the Dockerfile).
 numpy>=1.26
 pandas>=2.1
 scipy>=1.11
 openai>=1.40
 tavily-python>=0.5
-streamlit>=1.36
+streamlit>=1.50
 altair>=5.0
 python-dotenv>=1.0
-pytest>=8.0
-contree-sdk>=0.3.6
+# Token Factory Sandboxes SDK. Pre-alpha: pinned below 0.4 because the API is
+# still changing between minor versions.
+contree-sdk>=0.3.6,<0.4

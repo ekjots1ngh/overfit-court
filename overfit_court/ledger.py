@@ -1,11 +1,15 @@
 """The court remembers.
 
-Every configuration ever tried on a dataset is kept (its return stream on the
-open evidence), so the next trial is judged against all of it: the Reality
-Check's luck benchmark and the distinct-bets count both use the full record.
-Openings of the sealed evidence are recorded too, because evidence that has
-been looked at is no longer sealed.
+Every configuration ever tried on a dataset is kept: its daily returns on the
+open evidence. The next trial on the same data is judged against all of them,
+so the Reality Check's bar for luck and the distinct-bet count both grow as
+genuinely new ideas are tried. Each opening of the sealed evidence is recorded
+too, because evidence that has been looked at is no longer sealed.
+
+Records are keyed by `record_key`: a fingerprint of the exact prices plus the
+sealed fraction, so different data, or a different seal, starts a new record.
 """
+
 from __future__ import annotations
 
 import hashlib
@@ -18,80 +22,101 @@ import pandas as pd
 
 
 def fingerprint(prices: pd.DataFrame) -> str:
-    h = hashlib.sha256()
-    h.update(",".join(map(str, prices.columns)).encode())
-    h.update(pd.util.hash_pandas_object(prices, index=True).values.tobytes())
-    return h.hexdigest()[:16]
+    """A short hash of the asset names and every price and date."""
+    digest = hashlib.sha256()
+    digest.update(",".join(map(str, prices.columns)).encode())
+    digest.update(pd.util.hash_pandas_object(prices, index=True).values.tobytes())
+    return digest.hexdigest()[:16]
+
+
+def record_key(prices: pd.DataFrame, sealed_fraction: float) -> str:
+    return f"{fingerprint(prices)}-s{round(sealed_fraction * 100)}"
+
+
+def record_seed(key: str) -> int:
+    """A reproducible random seed for a record, so the same data gets the same bootstrap."""
+    return int(key[:8], 16)
 
 
 class Ledger:
-    """In memory by default; pass a directory to persist across sessions."""
+    """The court record. In memory by default; pass a directory to keep it across sessions.
 
-    def __init__(self, path: str | Path | None = None):
-        self.dir = Path(path).expanduser() if path else None
+    On disk: index.json (what was tried, verdicts, seal openings) and one .npy
+    file of daily returns per trial.
+    """
+
+    def __init__(self, directory: str | Path | None = None):
+        self.dir = Path(directory).expanduser() if directory else None
         self.index: dict[str, dict] = {}
-        self._returns: dict[str, list[np.ndarray]] = {}
+        self._returns: dict[str, list[np.ndarray]] = {}  # loaded lazily per key
         if self.dir and (self.dir / "index.json").exists():
             try:
                 self.index = json.loads((self.dir / "index.json").read_text())
             except json.JSONDecodeError:
-                self.index = {}
+                self.index = {}  # a corrupt index starts a fresh record
 
-    # ------------------------------------------------------------ reading
-    def _entry(self, fp: str) -> dict:
-        return self.index.setdefault(fp, {"trials": [], "seals": []})
+    # --- reading ---
+    def history(self, key: str) -> list[dict]:
+        """Every trial on this data, oldest first."""
+        return self.index.get(key, {}).get("trials", [])
 
-    def history(self, fp: str) -> list[dict]:
-        return self.index.get(fp, {}).get("trials", [])
+    def seals(self, key: str) -> list[dict]:
+        """Every time the sealed evidence for this data was opened."""
+        return self.index.get(key, {}).get("seals", [])
 
-    def seals(self, fp: str) -> list[dict]:
-        return self.index.get(fp, {}).get("seals", [])
+    def prior_returns(self, key: str) -> list[np.ndarray]:
+        """The daily returns of every configuration tried before, one T x N array per trial."""
+        if key not in self._returns:
+            arrays = []
+            for trial in self.history(key):
+                path = self.dir / trial["file"] if self.dir and trial.get("file") else None
+                if path and path.exists():
+                    arrays.append(np.load(path).astype(float))
+            self._returns[key] = arrays
+        return self._returns[key]
 
-    def prior_returns(self, fp: str) -> list[np.ndarray]:
-        if fp not in self._returns:
-            mats = []
-            for t in self.history(fp):
-                f = t.get("file")
-                if f and self.dir and (self.dir / f).exists():
-                    mats.append(np.load(self.dir / f).astype(float))
-            self._returns[fp] = mats
-        return self._returns[fp]
-
-    def prior_sharpes(self, fp: str) -> np.ndarray:
-        return np.array([s for t in self.history(fp) for s in t["sharpes"]], dtype=float)
-
-    # ------------------------------------------------------------ writing
-    def record(self, fp: str, idea: str, returns: np.ndarray, sharpes, verdict: str,
-               family: str | None = None) -> None:
+    # --- writing ---
+    def record(
+        self, key: str, idea: str, returns: np.ndarray, verdict: str, family: str | None = None
+    ) -> None:
+        """Add a trial's configurations to the record."""
         returns = np.asarray(returns, dtype=float)
-        self.prior_returns(fp)                       # make sure the cache is loaded
-        entry = self._entry(fp)
-        k = len(entry["trials"])
-        item = {"ts": round(time.time()), "idea": idea[:160], "family": family,
-                "n": int(returns.shape[1]), "sharpes": [round(float(x), 6) for x in sharpes],
-                "verdict": verdict}
+        self.prior_returns(key)  # load what is on disk before appending to it
+        entry = self._entry(key)
+        item = {
+            "ts": round(time.time()),
+            "idea": idea[:160],
+            "family": family,
+            "n": int(returns.shape[1]),
+            "verdict": verdict,
+        }
         if self.dir:
             self.dir.mkdir(parents=True, exist_ok=True)
-            item["file"] = f"{fp}_{k:04d}.npy"
+            item["file"] = f"{key}_{len(entry['trials']):04d}.npy"
             np.save(self.dir / item["file"], returns.astype(np.float32))
         entry["trials"].append(item)
-        self._returns.setdefault(fp, []).append(returns)
+        self._returns.setdefault(key, []).append(returns)
         self._save()
 
-    def record_seal(self, fp: str, commitment: str, summary: dict) -> None:
-        self._entry(fp)["seals"].append({"ts": round(time.time()), "commitment": commitment,
-                                         **summary})
+    def record_seal(self, key: str, commitment: str, summary: dict) -> None:
+        """Note that the sealed evidence was opened, and for which commitment."""
+        self._entry(key)["seals"].append(
+            {"ts": round(time.time()), "commitment": commitment, **summary}
+        )
         self._save()
 
-    def clear(self, fp: str | None = None) -> None:
-        fps = list(self.index) if fp is None else [fp]
-        for f in fps:
-            for t in self.index.get(f, {}).get("trials", []):
-                if self.dir and t.get("file") and (self.dir / t["file"]).exists():
-                    (self.dir / t["file"]).unlink()
-            self.index.pop(f, None)
-            self._returns.pop(f, None)
+    def clear(self, key: str | None = None) -> None:
+        """Forget one dataset's record, or everything."""
+        for k in list(self.index) if key is None else [key]:
+            for trial in self.index.get(k, {}).get("trials", []):
+                if self.dir and trial.get("file"):
+                    (self.dir / trial["file"]).unlink(missing_ok=True)
+            self.index.pop(k, None)
+            self._returns.pop(k, None)
         self._save()
+
+    def _entry(self, key: str) -> dict:
+        return self.index.setdefault(key, {"trials": [], "seals": []})
 
     def _save(self) -> None:
         if self.dir:

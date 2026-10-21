@@ -1,5 +1,41 @@
-import sys
-from pathlib import Path
+"""Shared fixtures. Every test runs offline: no API keys, no network, no files in the repo."""
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+import pytest
+
+from overfit_court.config import get_settings
+from overfit_court.sandbox import NebiusSandboxExecutor
+
+LIVE_VARIABLES = (
+    "NEBIUS_API_KEY",
+    "TAVILY_API_KEY",
+    "NEBIUS_PROJECT_ID",
+    "CONTREE_PROJECT",
+    "OC_EXECUTOR",
+    "OC_SANDBOX_IMAGE",
+)
+
+
+@pytest.fixture(autouse=True)
+def offline(monkeypatch, tmp_path):
+    """Strip live credentials (even ones loaded from a developer's .env) and keep caches in tmp."""
+    for name in LIVE_VARIABLES:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(NebiusSandboxExecutor, "IMAGE_CACHE", tmp_path / "sandbox_image")
+
+
+@pytest.fixture
+def settings():
+    """Demo-mode settings: library strategies stand in for model output."""
+    s = get_settings().offline()
+    s.executor = "local"
+    return s
+
+
+def _discard(*_args):
+    pass
+
+
+@pytest.fixture
+def silent():
+    """A log function that discards progress messages."""
+    return _discard

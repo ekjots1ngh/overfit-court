@@ -1,0 +1,30 @@
+# Tool configuration. Runtime dependencies live in requirements.txt (that is
+# what Streamlit Community Cloud and the Dockerfile install); development tools
+# live in requirements-dev.txt.
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+extend-exclude = [".streamlit"]
+
+[tool.ruff.lint]
+select = [
+    "E", "W",   # pycodestyle
+    "F",        # pyflakes
+    "I",        # import order
+    "B",        # likely bugs
+    "UP",       # modern syntax
+    "SIM",      # simplifications
+    "C4",       # comprehensions
+    "PIE",      # misc. lint
+    "RET",      # return statements
+    "PLC0415",  # imports belong at the top of the file
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["overfit_court"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = [".", "tests"]
+filterwarnings = ["ignore::DeprecationWarning:altair.*"]

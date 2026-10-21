@@ -1,19 +1,29 @@
-"""Settings, all overridable from environment variables or a .env file."""
+"""Settings, read from environment variables (or a .env file in the working directory).
+
+Nothing here is required: with no keys at all the app runs in demo mode.
+See .env.example for every variable.
+"""
+
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except ImportError:  # pragma: no cover
-    pass
+from dotenv import load_dotenv
+
+load_dotenv()
 
 
-def _f(name: str, default: float) -> float:
+def _env_float(name: str, default: float) -> float:
     try:
         return float(os.getenv(name, default))
+    except ValueError:
+        return default
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, default))
     except ValueError:
         return default
 
@@ -21,22 +31,26 @@ def _f(name: str, default: float) -> float:
 @dataclass
 class Settings:
     nebius_api_key: str | None
-    base_url: str
+    base_url: str  # Token Factory's OpenAI-compatible endpoint
     tavily_api_key: str | None
-    models: dict = field(default_factory=dict)
-    # USD per million tokens (input, output). Check your Token Factory console.
-    prices: dict = field(default_factory=dict)
-    executor: str = "local"
-    max_configs: int = 120
-    cost_bps: float = 5.0
+    models: dict = field(default_factory=dict)  # tier ("nano", "super", "ultra") -> model id
+    prices: dict = field(default_factory=dict)  # tier -> (USD per 1M input, per 1M output tokens)
+    executor: str = "local"  # "nebius" runs backtests in Token Factory Sandboxes
+    max_configs: int = 120  # largest parameter grid tried in one trial
+    cost_bps: float = 5.0  # trading cost per unit of turnover, in basis points
 
     @property
     def mock_llm(self) -> bool:
+        """Demo mode for the models: no key, so agents use library-based replies."""
         return not self.nebius_api_key
 
     @property
     def mock_search(self) -> bool:
         return not self.tavily_api_key
+
+    def offline(self) -> Settings:
+        """A copy with no API keys: demo mode, fully reproducible, nothing leaves the machine."""
+        return replace(self, nebius_api_key=None, tavily_api_key=None)
 
 
 def get_settings() -> Settings:
@@ -44,18 +58,19 @@ def get_settings() -> Settings:
         nebius_api_key=os.getenv("NEBIUS_API_KEY"),
         base_url=os.getenv("NEBIUS_BASE_URL", "https://api.tokenfactory.nebius.com/v1/"),
         tavily_api_key=os.getenv("TAVILY_API_KEY"),
-        # Verify exact IDs with GET /v1/models on your account (python -m overfit_court.preflight).
+        # Model ids differ between accounts: `python -m overfit_court.preflight` lists yours.
         models={
             "nano": os.getenv("MODEL_NANO", "nvidia/nemotron-3-nano-30b-a3b"),
             "super": os.getenv("MODEL_SUPER", "nvidia/nemotron-3-super-120b-a12b"),
             "ultra": os.getenv("MODEL_ULTRA", "nvidia/nemotron-3-ultra-550b-a55b"),
         },
+        # Only used to report spend; check your Token Factory console for current prices.
         prices={
-            "nano": (_f("PRICE_NANO_IN", 0.06), _f("PRICE_NANO_OUT", 0.24)),
-            "super": (_f("PRICE_SUPER_IN", 0.30), _f("PRICE_SUPER_OUT", 0.90)),
-            "ultra": (_f("PRICE_ULTRA_IN", 1.00), _f("PRICE_ULTRA_OUT", 3.00)),
+            "nano": (_env_float("PRICE_NANO_IN", 0.06), _env_float("PRICE_NANO_OUT", 0.24)),
+            "super": (_env_float("PRICE_SUPER_IN", 0.30), _env_float("PRICE_SUPER_OUT", 0.90)),
+            "ultra": (_env_float("PRICE_ULTRA_IN", 1.00), _env_float("PRICE_ULTRA_OUT", 3.00)),
         },
         executor=os.getenv("OC_EXECUTOR", "local"),
-        max_configs=int(os.getenv("OC_MAX_CONFIGS", 120)),
-        cost_bps=_f("OC_COST_BPS", 5.0),
+        max_configs=_env_int("OC_MAX_CONFIGS", 120),
+        cost_bps=_env_float("OC_COST_BPS", 5.0),
     )

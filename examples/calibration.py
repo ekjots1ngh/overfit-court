@@ -1,40 +1,64 @@
-"""Is the court calibrated? Run it on markets where we KNOW the truth.
+"""Calibration: is the court right on markets where we know the truth?
 
-signal = 0   pure noise: every 'edge' is overfitting (should never be acquitted)
-signal > 0   planted persistent drifts that momentum can genuinely detect
+Three kinds of synthetic market, many random seeds each:
+    none (noise)   every "edge" is overfitting; the court should never acquit
+    weak, strong   a real persistent edge is planted; momentum can find it
 
-Each trial is judged on the open 75% of the data, then the committed
-strategy is tested once on the sealed 25%.
+Each trial is judged on the open 75% of the data, then its winner is tested
+once on the sealed 25%. Runs in demo mode with the built-in strategy library,
+so it is reproducible and no model-written code ever runs in-process.
 
-Usage: python examples/calibration.py [n_seeds]
+    python -m examples.calibration [n_seeds]
 """
+
 import sys
 import time
 from collections import Counter
 
+from overfit_court.config import get_settings
 from overfit_court.data import synthetic_prices
 from overfit_court.pipeline import run_trial, unseal
 from overfit_court.sandbox import InProcessExecutor
 
-levels = {"none (noise)": 0.0, "weak": 0.0004, "strong": 0.0008}
-n = int(sys.argv[1]) if len(sys.argv) > 1 else 10
-ex = InProcessExecutor()          # library code is trusted; model-written code never runs here
-quiet = lambda *a: None
-print("| Planted edge | Runs | Convicted | Hung jury | Acquitted | Sealed: confirmed | Sealed: refuted "
-      "| Median best Sharpe (open) | Median Sharpe (sealed) |")
-print("|---|---|---|---|---|---|---|---|---|")
-t0 = time.perf_counter()
-for label, sig in levels.items():
-    v, sealed_v, naive, sealed_sr = Counter(), Counter(), [], []
-    for seed in range(n):
-        px = synthetic_prices(signal=sig, seed=100 + seed)
-        t = run_trial("buy recent winners, short losers", px, executor=ex, log=quiet)
-        s = unseal(t, executor=ex, log=quiet)
-        v[t.verdict] += 1
-        sealed_v[s.verdict] += 1
-        naive.append(t.evidence()["best_sharpe_annual"])
-        sealed_sr.append(s.sealed_sharpe_annual)
-    med = lambda xs: sorted(xs)[len(xs) // 2]
-    print(f"| {label} | {n} | {v['CONVICTED']} | {v['HUNG JURY']} | {v['ACQUITTED']} | "
-          f"{sealed_v['CONFIRMED']} | {sealed_v['REFUTED']} | {med(naive):.2f} | {med(sealed_sr):.2f} |")
-print(f"\n{3 * n} trials in {time.perf_counter() - t0:.0f}s")
+PLANTED_EDGE = {"none (noise)": 0.0, "weak": 0.0004, "strong": 0.0008}
+IDEA = "buy recent winners, short losers"
+
+
+def silent(*_args):
+    pass
+
+
+def median(values):
+    return sorted(values)[len(values) // 2]
+
+
+def main(n_seeds: int) -> None:
+    settings = get_settings().offline()
+    executor = InProcessExecutor()
+    print(
+        "| Planted edge | Runs | Convicted | Hung jury | Acquitted | Sealed: confirmed "
+        "| Sealed: refuted | Median best Sharpe (open) | Median Sharpe (sealed) |"
+    )
+    print("|---|---|---|---|---|---|---|---|---|")
+    start = time.perf_counter()
+    for label, signal in PLANTED_EDGE.items():
+        verdicts, sealed_verdicts, open_sharpes, sealed_sharpes = Counter(), Counter(), [], []
+        for seed in range(n_seeds):
+            prices = synthetic_prices(signal=signal, seed=100 + seed)
+            trial = run_trial(IDEA, prices, settings, executor=executor, log=silent)
+            sealed = unseal(trial, executor, settings=settings, log=silent)
+            verdicts[trial.verdict] += 1
+            sealed_verdicts[sealed.verdict] += 1
+            open_sharpes.append(trial.evidence()["best_sharpe_annual"])
+            sealed_sharpes.append(sealed.sealed_sharpe_annual)
+        print(
+            f"| {label} | {n_seeds} | {verdicts['CONVICTED']} | {verdicts['HUNG JURY']} | "
+            f"{verdicts['ACQUITTED']} | {sealed_verdicts['CONFIRMED']} | "
+            f"{sealed_verdicts['REFUTED']} | {median(open_sharpes):.2f} | "
+            f"{median(sealed_sharpes):.2f} |"
+        )
+    print(f"\n{3 * n_seeds} trials in {time.perf_counter() - start:.0f}s")
+
+
+if __name__ == "__main__":
+    main(int(sys.argv[1]) if len(sys.argv) > 1 else 10)

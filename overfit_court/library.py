@@ -1,10 +1,17 @@
-"""A garden of forking paths: strategy families an agent can fish in.
+"""The strategy library: a small garden of forking paths.
 
-Used three ways: demo mode (no API key) routes ideas to a family by keyword,
-the scripted fisherman explores them, and the Nemotron fisherman chooses
-among them. Every function follows the harness contract: weights at row t
-use data up to row t only; the harness lags them and charges costs.
+Eight honest strategy families, plus one deliberately leaky draft, used in
+three places:
+
+- demo mode (no API key): an idea is routed to a family by keyword, and the
+  family's code stands in for what Nemotron would write;
+- the scripted fisherman, which explores the families;
+- the Nemotron fisherman, which chooses among them.
+
+Every strategy follows the harness contract: the weights for day t may use
+prices up to day t only. The harness lags them by a day and charges costs.
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -12,33 +19,42 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True)
 class Family:
-    name: str
-    title: str
-    hypothesis: str
-    keywords: tuple
-    param_grid: dict
-    code: str
-    search_queries: tuple = ()
-    fixed_code: str = ""        # demo mode: what a repair produces
-    fishable: bool = True       # offered to the fishing expedition
+    name: str  # short identifier, e.g. "momentum"
+    title: str  # human-readable name
+    hypothesis: str  # the effect the strategy bets on
+    keywords: tuple  # demo mode routes an idea here if it contains one of these
+    param_grid: dict  # parameter name -> values to try
+    code: str  # source defining positions(prices, **params)
+    search_queries: tuple = ()  # prior-art searches for this effect
+    fixed_code: str = ""  # demo mode only: what a repair of `code` produces
+    fishable: bool = True  # offered to the fishing expedition
 
 
-def _f(name, title, hypothesis, keywords, grid, code, queries=(), fixed="", fishable=True):
-    return Family(name, title, hypothesis, tuple(keywords), grid, code.strip() + "\n",
-                  tuple(queries), fixed.strip() + "\n" if fixed else "", fishable)
+def _source(text: str) -> str:
+    return text.strip() + "\n"
 
 
-FAMILIES = {f.name: f for f in [
-    # A plausible idea whose obvious implementation reads the future: the mean
-    # and standard deviation are taken over the whole series, including dates
-    # that have not happened yet. A code review usually misses it; the
-    # time-travel test does not. Demo mode shows the catch and the repair.
-    _f("anchor", "Reversion to the long-run average",
-       "Assets trading below their long-run average price drift back up to it.",
-       ["long-run average", "long run average", "average price", "below their average",
-        "below average", "fair value", "anchor"],
-       {"band": [0.0, 0.25, 0.5, 0.75, 1.0, 1.5], "window": [60, 120, 250, 500]},
-       '''
+_ALL = [
+    # A plausible idea whose natural first draft reads the future: the mean and
+    # standard deviation are taken over the whole series, including dates that
+    # haven't happened yet (and the `window` parameter it was meant to use is
+    # ignored). Code review usually misses it; the time-travel test doesn't. In
+    # demo mode the repair swaps in `fixed_code`, which uses rolling windows.
+    Family(
+        name="anchor",
+        title="Reversion to the long-run average",
+        hypothesis="Assets trading below their long-run average price drift back up to it.",
+        keywords=(
+            "long-run average",
+            "long run average",
+            "average price",
+            "below their average",
+            "below average",
+            "fair value",
+            "anchor",
+        ),
+        param_grid={"band": [0.0, 0.25, 0.5, 0.75, 1.0, 1.5], "window": [60, 120, 250, 500]},
+        code=_source("""
 import numpy as np
 import pandas as pd
 
@@ -47,8 +63,8 @@ def positions(prices: pd.DataFrame, band: float = 0.5, window: int = 250) -> pd.
     # how far is each asset from its long-run average price?
     z = (prices - prices.mean()) / prices.std()
     return (-np.sign(z)).where(z.abs() > band, 0.0)
-''', ["mean reversion to long run average price stocks", "anchoring fair value reversion"],
-       fixed='''
+"""),
+        fixed_code=_source("""
 import numpy as np
 import pandas as pd
 
@@ -59,14 +75,30 @@ def positions(prices: pd.DataFrame, band: float = 0.5, window: int = 250) -> pd.
     sd = prices.rolling(window, min_periods=window).std()
     z = (prices - ma) / sd
     return (-np.sign(z)).where(z.abs() > band, 0.0).fillna(0.0)
-''', fishable=False),
-
-    _f("weekday", "Day-of-week effect",
-       "Returns on one weekday are systematically different from the others.",
-       ["monday", "tuesday", "wednesday", "thursday", "friday", "weekday", "day of week",
-        "day-of-week", "weekend"],
-       {"day": [0, 1, 2, 3, 4], "side": [1, -1]},
-       '''
+"""),
+        search_queries=(
+            "mean reversion to long run average price stocks",
+            "anchoring fair value reversion",
+        ),
+        fishable=False,
+    ),
+    Family(
+        name="weekday",
+        title="Day-of-week effect",
+        hypothesis="Returns on one weekday are systematically different from the others.",
+        keywords=(
+            "monday",
+            "tuesday",
+            "wednesday",
+            "thursday",
+            "friday",
+            "weekday",
+            "day of week",
+            "day-of-week",
+            "weekend",
+        ),
+        param_grid={"day": [0, 1, 2, 3, 4], "side": [1, -1]},
+        code=_source("""
 import numpy as np
 import pandas as pd
 
@@ -78,13 +110,16 @@ def positions(prices: pd.DataFrame, day: int = 0, side: int = 1) -> pd.DataFrame
     hold = (tomorrow == day).astype(float)
     w = np.repeat(hold[:, None] * side, prices.shape[1], axis=1)
     return pd.DataFrame(w, index=prices.index, columns=prices.columns)
-''', ["day of week effect stock returns", "weekend effect anomaly"]),
-
-    _f("ma_cross", "Moving-average crossover",
-       "Assets trading above a slower moving average keep rising.",
-       ["moving average", "crossover", "golden cross", "death cross", "sma", "ema"],
-       {"fast": [5, 10, 20, 50], "slow": [50, 100, 150, 200]},
-       '''
+"""),
+        search_queries=("day of week effect stock returns", "weekend effect anomaly"),
+    ),
+    Family(
+        name="ma_cross",
+        title="Moving-average crossover",
+        hypothesis="Assets trading above a slower moving average keep rising.",
+        keywords=("moving average", "crossover", "golden cross", "death cross", "sma", "ema"),
+        param_grid={"fast": [5, 10, 20, 50], "slow": [50, 100, 150, 200]},
+        code=_source("""
 import numpy as np
 import pandas as pd
 
@@ -93,13 +128,19 @@ def positions(prices: pd.DataFrame, fast: int = 20, slow: int = 100) -> pd.DataF
     f = prices.rolling(fast).mean()
     s = prices.rolling(slow).mean()
     return np.sign(f - s).where(s.notna(), 0.0)
-''', ["moving average crossover trading rule profitability", "technical trading rules data snooping"]),
-
-    _f("breakout", "Channel breakout",
-       "New highs lead to further gains; new lows to further losses.",
-       ["breakout", "donchian", "new high", "channel", "turtle"],
-       {"window": [20, 40, 55, 100, 150, 200]},
-       '''
+"""),
+        search_queries=(
+            "moving average crossover trading rule profitability",
+            "technical trading rules data snooping",
+        ),
+    ),
+    Family(
+        name="breakout",
+        title="Channel breakout",
+        hypothesis="New highs lead to further gains; new lows to further losses.",
+        keywords=("breakout", "donchian", "new high", "channel", "turtle"),
+        param_grid={"window": [20, 40, 55, 100, 150, 200]},
+        code=_source("""
 import numpy as np
 import pandas as pd
 
@@ -111,14 +152,25 @@ def positions(prices: pd.DataFrame, window: int = 55) -> pd.DataFrame:
     sig[prices >= hi] = 1.0
     sig[prices <= lo] = -1.0
     return sig.ffill().fillna(0.0)
-''', ["donchian channel breakout performance", "turtle trading rules evidence"]),
-
-    _f("zscore", "Mean reversion from stretched prices",
-       "Prices far from their recent average snap back.",
-       ["mean reversion", "mean-reversion", "z-score", "zscore", "stretched", "snap back",
-        "oversold", "overbought"],
-       {"window": [10, 20, 40, 60], "entry": [0.5, 1.0, 1.5, 2.0]},
-       '''
+"""),
+        search_queries=("donchian channel breakout performance", "turtle trading rules evidence"),
+    ),
+    Family(
+        name="zscore",
+        title="Mean reversion from stretched prices",
+        hypothesis="Prices far from their recent average snap back.",
+        keywords=(
+            "mean reversion",
+            "mean-reversion",
+            "z-score",
+            "zscore",
+            "stretched",
+            "snap back",
+            "oversold",
+            "overbought",
+        ),
+        param_grid={"window": [10, 20, 40, 60], "entry": [0.5, 1.0, 1.5, 2.0]},
+        code=_source("""
 import numpy as np
 import pandas as pd
 
@@ -128,14 +180,24 @@ def positions(prices: pd.DataFrame, window: int = 20, entry: float = 1.0) -> pd.
     sd = prices.rolling(window).std()
     z = (prices - ma) / sd
     return (-np.sign(z)).where(z.abs() > entry, 0.0).fillna(0.0)
-''', ["short-term mean reversion equities", "z-score mean reversion strategy"]),
-
-    _f("reversal", "Short-term reversal",
-       "Last week's losers beat last week's winners.",
-       ["reversal", "buy losers", "buy the losers", "last week's losers", "buy last week",
-        "overreaction", "contrarian"],
-       {"lookback": [1, 2, 3, 5, 10], "top_frac": [0.2, 0.3, 0.4]},
-       '''
+"""),
+        search_queries=("short-term mean reversion equities", "z-score mean reversion strategy"),
+    ),
+    Family(
+        name="reversal",
+        title="Short-term reversal",
+        hypothesis="Last week's losers beat last week's winners.",
+        keywords=(
+            "reversal",
+            "buy losers",
+            "buy the losers",
+            "last week's losers",
+            "buy last week",
+            "overreaction",
+            "contrarian",
+        ),
+        param_grid={"lookback": [1, 2, 3, 5, 10], "top_frac": [0.2, 0.3, 0.4]},
+        code=_source("""
 import pandas as pd
 
 
@@ -145,13 +207,16 @@ def positions(prices: pd.DataFrame, lookback: int = 5, top_frac: float = 0.3) ->
     longs = (ranks <= top_frac).astype(float)
     shorts = (ranks >= 1.0 - top_frac).astype(float)
     return (longs - shorts).where(past.notna(), 0.0)
-''', ["short-term reversal anomaly Jegadeesh 1990", "weekly reversal effect"]),
-
-    _f("low_vol", "Low-volatility anomaly",
-       "Calm assets beat volatile ones on a risk-adjusted basis.",
-       ["volatility", "low vol", "low-vol", "calm", "defensive", "betting against beta"],
-       {"vol_window": [20, 60, 120, 250], "top_frac": [0.2, 0.3, 0.4]},
-       '''
+"""),
+        search_queries=("short-term reversal anomaly Jegadeesh 1990", "weekly reversal effect"),
+    ),
+    Family(
+        name="low_vol",
+        title="Low-volatility anomaly",
+        hypothesis="Calm assets beat volatile ones on a risk-adjusted basis.",
+        keywords=("volatility", "low vol", "low-vol", "calm", "defensive", "betting against beta"),
+        param_grid={"vol_window": [20, 60, 120, 250], "top_frac": [0.2, 0.3, 0.4]},
+        code=_source("""
 import numpy as np
 import pandas as pd
 
@@ -162,13 +227,24 @@ def positions(prices: pd.DataFrame, vol_window: int = 60, top_frac: float = 0.3)
     longs = (ranks <= top_frac).astype(float)
     shorts = (ranks >= 1.0 - top_frac).astype(float)
     return (longs - shorts).where(vol.notna(), 0.0)
-''', ["low volatility anomaly", "betting against beta Frazzini Pedersen"]),
-
-    _f("trend", "Time-series momentum",
-       "An asset that has risen over the past months keeps rising, regardless of the others.",
-       ["time-series", "time series", "trend following", "trend-following", "trend", "cta"],
-       {"lookback": [20, 60, 120, 250], "vol_window": [20, 60, 120]},
-       '''
+"""),
+        search_queries=("low volatility anomaly", "betting against beta Frazzini Pedersen"),
+    ),
+    Family(
+        name="trend",
+        title="Time-series momentum",
+        hypothesis="An asset that has risen over the past months keeps rising, "
+        "regardless of the others.",
+        keywords=(
+            "time-series",
+            "time series",
+            "trend following",
+            "trend-following",
+            "trend",
+            "cta",
+        ),
+        param_grid={"lookback": [20, 60, 120, 250], "vol_window": [20, 60, 120]},
+        code=_source("""
 import numpy as np
 import pandas as pd
 
@@ -179,14 +255,23 @@ def positions(prices: pd.DataFrame, lookback: int = 120, vol_window: int = 60) -
     raw = np.sign(past) / vol
     raw = raw.replace([np.inf, -np.inf], np.nan)
     return raw.div(raw.abs().sum(axis=1), axis=0).fillna(0.0)
-''', ["time series momentum Moskowitz Ooi Pedersen", "trend following century of evidence"]),
-
-    _f("momentum", "Cross-sectional momentum",
-       "Assets that outperformed over the past months keep outperforming.",
-       ["momentum", "winners", "went up", "outperform", "relative strength"],
-       {"lookback": [20, 40, 60, 90, 120, 180, 250], "skip": [0, 5, 21],
-        "top_frac": [0.2, 0.3, 0.4]},
-       '''
+"""),
+        search_queries=(
+            "time series momentum Moskowitz Ooi Pedersen",
+            "trend following century of evidence",
+        ),
+    ),
+    Family(
+        name="momentum",
+        title="Cross-sectional momentum",
+        hypothesis="Assets that outperformed over the past months keep outperforming.",
+        keywords=("momentum", "winners", "went up", "outperform", "relative strength"),
+        param_grid={
+            "lookback": [20, 40, 60, 90, 120, 180, 250],
+            "skip": [0, 5, 21],
+            "top_frac": [0.2, 0.3, 0.4],
+        },
+        code=_source("""
 import numpy as np
 import pandas as pd
 
@@ -198,50 +283,68 @@ def positions(prices: pd.DataFrame, lookback: int = 60, skip: int = 5,
     longs = (ranks >= 1.0 - top_frac).astype(float)
     shorts = (ranks <= top_frac).astype(float)
     return (longs - shorts).where(past.notna(), 0.0)
-''', ["cross-sectional momentum anomaly Jegadeesh Titman", "momentum crash risk"]),
-]}
+"""),
+        search_queries=(
+            "cross-sectional momentum anomaly Jegadeesh Titman",
+            "momentum crash risk",
+        ),
+    ),
+]
 
+FAMILIES: dict[str, Family] = {f.name: f for f in _ALL}
+FISHABLE: dict[str, Family] = {name: f for name, f in FAMILIES.items() if f.fishable}
 DEFAULT = "momentum"
-FISHABLE = {k: f for k, f in FAMILIES.items() if f.fishable}
 
 
 def route(idea: str) -> Family:
-    """Pick the family whose keywords best match the idea (demo mode only)."""
+    """Demo mode: the first family with a keyword in the idea (most specific families first)."""
     text = idea.lower()
-    for fam in FAMILIES.values():          # dict order puts specific families first
-        if any(k in text for k in fam.keywords):
-            return fam
+    for family in _ALL:
+        if any(keyword in text for keyword in family.keywords):
+            return family
     return FAMILIES[DEFAULT]
 
 
-def spec_for(fam: Family) -> dict:
-    return {"name": fam.title, "hypothesis": fam.hypothesis, "family": fam.name,
-            "signal_description": fam.hypothesis, "param_grid": dict(fam.param_grid),
-            "search_queries": list(fam.search_queries), "known_risks": []}
+def spec_for(family: Family) -> dict:
+    """The planner's spec for a family, in the same shape Nemotron Ultra returns."""
+    return {
+        "name": family.title,
+        "hypothesis": family.hypothesis,
+        "family": family.name,
+        "signal_description": family.hypothesis,
+        "param_grid": dict(family.param_grid),
+        "search_queries": list(family.search_queries),
+        "known_risks": [],
+    }
 
 
-# ------------------------------------------------------------------ universes
-UNIVERSES = list(range(0, 25))     # 0 = every asset; 1..24 = a fixed random half
+# --- universe selection ---
+# One more fork in the garden: "the effect only works on these assets". Universe
+# 0 trades every asset; universes 1 to 24 each trade a fixed random half. The
+# wrapper is appended to a strategy's source, so it runs inside the sandbox too.
+UNIVERSES = list(range(25))
 
-UNIVERSE_WRAPPER = '''
+_UNIVERSE_WRAPPER = '''
 
-_base_positions = positions
+import numpy as _np
+
+_unrestricted_positions = positions
 
 
 def positions(prices, universe=0, **params):
-    """Universe selection: 'the effect only works on these assets'."""
-    import numpy as _np
-    w = _base_positions(prices, **params)
+    """Trade only a fixed random half of the assets, chosen by `universe` (0 = all)."""
+    weights = _unrestricted_positions(prices, **params)
     if universe:
         n = prices.shape[1]
-        keep = _np.random.default_rng(int(universe)).choice(n, size=max(2, n // 2), replace=False)
-        mask = _np.zeros(n, dtype=bool)
-        mask[keep] = True
-        w = w.copy()
-        w.loc[:, ~mask] = 0.0
-    return w
+        chosen = _np.random.default_rng(int(universe)).choice(n, size=max(2, n // 2), replace=False)
+        keep = _np.zeros(n, dtype=bool)
+        keep[chosen] = True
+        weights = weights.copy()
+        weights.loc[:, ~keep] = 0.0
+    return weights
 '''
 
 
 def with_universe(code: str) -> str:
-    return code + UNIVERSE_WRAPPER
+    """A strategy's source with the universe-selection parameter added."""
+    return code + _UNIVERSE_WRAPPER

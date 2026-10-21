@@ -1,29 +1,40 @@
-"""The deployed app is what judges see: it must load and every act must run."""
+"""The deployed app is what judges see: it must load, and every demo act must run."""
+
 import importlib
 import pkgutil
 from pathlib import Path
 
-import overfit_court
 from streamlit.testing.v1 import AppTest
+
+import overfit_court
 
 APP = str(Path(__file__).resolve().parents[1] / "app.py")
 
 
 def test_every_module_imports():
-    for m in pkgutil.iter_modules(overfit_court.__path__):
-        importlib.import_module(f"overfit_court.{m.name}")
+    for module in pkgutil.iter_modules(overfit_court.__path__):
+        importlib.import_module(f"overfit_court.{module.name}")
 
 
-def test_start_here_tab_runs_all_three_acts(monkeypatch):
-    monkeypatch.delenv("NEBIUS_API_KEY", raising=False)
-    at = AppTest.from_file(APP, default_timeout=300)
-    at.run()
-    assert not at.exception
+def test_the_start_here_tab_runs_all_three_acts():
+    app = AppTest.from_file(APP, default_timeout=300)
+    app.run()
+    assert not app.exception
     for key in ("act1", "act2", "act3"):
-        at.button(key=key).click().run()
-        assert not at.exception, key
-    text = " ".join(m.value for m in at.markdown)
+        app.button(key=key).click().run()
+        assert not app.exception, key
+    text = " ".join(block.value for block in app.markdown)
     assert "Statistics alone: ACQUITTED" in text
     assert "With the time-travel test: CONVICTED" in text
     assert "Sealed evidence: CONFIRMED" in text
-    assert any(d.label == "Download the court record" for d in at.get("download_button"))
+    assert any(b.label == "Download the court record" for b in app.get("download_button"))
+
+
+def test_the_trial_tab_and_the_evidence_room():
+    app = AppTest.from_file(APP, default_timeout=300)
+    app.run()
+    next(b for b in app.button if b.label == "Begin trial").click().run()
+    assert not app.exception
+    next(b for b in app.button if b.label.startswith("Commit")).click().run()
+    assert not app.exception
+    assert any("Sealed evidence:" in block.value for block in app.markdown)

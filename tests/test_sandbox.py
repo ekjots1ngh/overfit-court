@@ -1,44 +1,43 @@
-import numpy as np
+"""The Token Factory Sandboxes executor, against a stand-in for contree-sdk."""
 
-from overfit_court.agents import MOCK_CODE
+import numpy as np
+from fake_contree import FakeContree
+
 from overfit_court.data import synthetic_prices
+from overfit_court.library import FAMILIES
 from overfit_court.pipeline import expand_grid
 from overfit_court.sandbox import LocalExecutor, NebiusSandboxExecutor
 
-from fake_contree import FakeContree
-
+MOMENTUM = FAMILIES["momentum"].code
 GRID = expand_grid({"lookback": [20, 60, 120], "skip": [0, 5], "top_frac": [0.2, 0.3]}, 100)
 
 
-def test_sandbox_executor_matches_local(tmp_path, monkeypatch):
-    monkeypatch.setattr(NebiusSandboxExecutor, "CACHE", tmp_path / "img")
-    monkeypatch.delenv("OC_SANDBOX_IMAGE", raising=False)
+def test_sandbox_results_match_a_local_run():
     prices = synthetic_prices(n_days=600, seed=1)
-    local = LocalExecutor(n_workers=2).run(MOCK_CODE, prices, GRID, 5.0)
+    local = LocalExecutor(n_chunks=2).run(MOMENTUM, prices, GRID, 5.0)
     fake = FakeContree()
-    remote = NebiusSandboxExecutor(n_workers=4, client=fake).run(MOCK_CODE, prices, GRID, 5.0)
+    remote = NebiusSandboxExecutor(n_chunks=4, client=fake).run(MOMENTUM, prices, GRID, 5.0)
     assert remote.returns.shape == local.returns.shape == (600, 12)
-    assert np.allclose(remote.returns.values, local.returns.values)
+    assert np.allclose(remote.returns.to_numpy(), local.returns.to_numpy())
     assert not remote.errors
-    # base -> deps checkpoint -> trial checkpoint -> 4 branches
+    # base image -> dependencies checkpoint -> trial checkpoint -> 4 parallel branches
     assert len(fake.created) == 1 + 1 + 1 + 4
     assert remote.summary()["branches"] == 4
-    assert (tmp_path / "img").exists()      # deps image cached for next time
+    assert [step["step"] for step in remote.setup] == ["dependencies image", "trial checkpoint"]
+    assert NebiusSandboxExecutor.IMAGE_CACHE.exists()  # reused by the next trial
 
 
-def test_sandbox_executor_reports_broken_code(tmp_path, monkeypatch):
-    monkeypatch.setattr(NebiusSandboxExecutor, "CACHE", tmp_path / "img")
+def test_a_crashing_strategy_reports_every_configuration():
     prices = synthetic_prices(n_days=300, seed=2)
-    bad = "def positions(prices, **p):\n    raise KeyError('nope')\n"
-    res = NebiusSandboxExecutor(client=FakeContree()).run(bad, prices, GRID, 5.0)
-    assert res.returns.shape[1] == 0
-    assert len(res.errors) == len(GRID)
-    assert "KeyError" in next(iter(res.errors.values()))
+    crashing = "def positions(prices, **params):\n    raise KeyError('nope')\n"
+    result = NebiusSandboxExecutor(client=FakeContree()).run(crashing, prices, GRID, 5.0)
+    assert result.returns.shape[1] == 0
+    assert len(result.errors) == len(GRID)
+    assert "KeyError" in next(iter(result.errors.values()))
 
 
-def test_sandbox_executor_reports_import_failure(tmp_path, monkeypatch):
-    monkeypatch.setattr(NebiusSandboxExecutor, "CACHE", tmp_path / "img")
+def test_code_that_does_not_import_fails_before_any_branch():
     prices = synthetic_prices(n_days=300, seed=2)
-    res = NebiusSandboxExecutor(client=FakeContree()).run("this is not python", prices, GRID, 5.0)
-    assert res.returns.shape[1] == 0
-    assert "failed to import" in next(iter(res.errors.values()))
+    result = NebiusSandboxExecutor(client=FakeContree()).run("not python", prices, GRID, 5.0)
+    assert result.returns.shape[1] == 0
+    assert "failed to import" in next(iter(result.errors.values()))

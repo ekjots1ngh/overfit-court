@@ -1,126 +1,170 @@
 """Pre-flight check for live keys: python -m overfit_court.preflight
 
-Verifies, in order: Token Factory auth and model IDs, one real call per
-Nemotron tier (with measured latency and cost), Token Factory Sandboxes
-(import image, run python, branch, read a file back), and Tavily search.
+Checks, in order:
+
+1. Token Factory: the key works, and the three Nemotron model ids exist
+   (if not, lists the Nemotron ids your account can see).
+2. One real call per tier, with latency, tokens and cost; and whether each tier
+   accepts JSON mode (if not, the client falls back to asking in the prompt).
+3. Token Factory Sandboxes: a real small job through the real code path
+   (dependencies image, trial checkpoint, parallel branches, time-travel
+   branch, results read back), compared against the same job run locally.
+4. Tavily: one search.
 """
+
 from __future__ import annotations
 
-import asyncio
 import os
 import time
 
-from .config import get_settings
+import numpy as np
+from tavily import TavilyClient
+
+from .config import Settings, get_settings
+from .data import synthetic_prices
+from .library import FAMILIES
 from .llm import LLM
+from .pipeline import expand_grid, time_travel_probes
+from .sandbox import LocalExecutor, NebiusSandboxExecutor
 
-OK, FAIL, SKIP = "PASS", "FAIL", "SKIP"
+PASS, FAIL, SKIP = "PASS", "FAIL", "SKIP"
+TIERS = ("nano", "super", "ultra")
 
 
-def line(status: str, what: str, detail: str = "") -> None:
+def report(status: str, what: str, detail: str = "") -> None:
     print(f"[{status}] {what}" + (f"  ({detail})" if detail else ""))
 
 
-def check_models(s) -> bool:
-    if not s.nebius_api_key:
-        line(SKIP, "Token Factory", "NEBIUS_API_KEY not set")
-        return False
-    from openai import OpenAI
-    client = OpenAI(base_url=s.base_url, api_key=s.nebius_api_key)
+def check_models(settings: Settings, llm: LLM) -> bool:
     try:
-        ids = {m.id for m in client.models.list().data}
+        available = {m.id for m in llm.client.models.list().data}
     except Exception as e:
-        line(FAIL, f"list models at {s.base_url}", f"{type(e).__name__}: {e}. "
-             "Check NEBIUS_BASE_URL against the Token Factory quickstart.")
+        report(
+            FAIL,
+            f"list models at {settings.base_url}",
+            f"{type(e).__name__}: {e}. Check NEBIUS_BASE_URL against the Token Factory quickstart.",
+        )
         return False
-    line(OK, f"Token Factory auth, {len(ids)} models visible")
-    good = True
-    for tier, model in s.models.items():
-        if model in ids:
-            line(OK, f"{tier}: {model}")
+    report(PASS, f"Token Factory key works, {len(available)} models visible")
+    all_found = True
+    for tier, model in settings.models.items():
+        if model in available:
+            report(PASS, f"{tier}: {model}")
         else:
-            nemo = sorted(i for i in ids if "nemotron" in i.lower())
-            line(FAIL, f"{tier}: {model} not found", f"set MODEL_{tier.upper()} to one of {nemo}")
-            good = False
-    return good
+            nemotron = sorted(m for m in available if "nemotron" in m.lower())
+            report(
+                FAIL, f"{tier}: {model} not found", f"set MODEL_{tier.upper()} to one of {nemotron}"
+            )
+            all_found = False
+    return all_found
 
 
-def check_calls(s) -> None:
-    llm = LLM(s)
-    for tier in ("nano", "super", "ultra"):
+def check_calls(settings: Settings, llm: LLM) -> None:
+    for tier in TIERS:
         try:
-            out = llm.chat("preflight", tier, "Reply with the single word: ready.", "Status?",
-                           mock=lambda: "ready", max_tokens=400)
-            c = llm.ledger[-1]
-            line(OK, f"{tier} call", f"{c.latency_s:.1f}s, {c.input_tokens}+{c.output_tokens} tokens, "
-                 f"${c.cost_usd:.6f}, said {out[:30]!r}")
+            reply = llm.chat(
+                "preflight",
+                tier,
+                "Reply with the single word: ready.",
+                "Status?",
+                mock=lambda: "ready",
+                max_tokens=400,
+            )
+            call = llm.ledger[-1]
+            report(
+                PASS,
+                f"{tier} call",
+                f"{call.latency_s:.1f}s, {call.input_tokens}+{call.output_tokens} tokens, "
+                f"${call.cost_usd:.6f}, replied {reply[:30]!r}",
+            )
         except Exception as e:
-            line(FAIL, f"{tier} call", f"{type(e).__name__}: {e}")
-    # JSON mode: if a tier rejects response_format the client falls back to asking in the
-    # prompt; worth knowing, and worth reporting in the hackathon feedback
-    for tier in ("nano", "super", "ultra"):
+            report(FAIL, f"{tier} call", f"{type(e).__name__}: {e}")
+
+    for tier in TIERS:
         try:
             llm.client.chat.completions.create(
-                model=s.models[tier], max_tokens=200, response_format={"type": "json_object"},
-                messages=[{"role": "user", "content": 'Reply with {"ok": true}'}])
-            line(OK, f"{tier} JSON mode accepted")
+                model=settings.models[tier],
+                max_tokens=200,
+                response_format={"type": "json_object"},
+                messages=[{"role": "user", "content": 'Reply with {"ok": true}'}],
+            )
+            report(PASS, f"{tier} accepts JSON mode")
         except Exception as e:
-            line(SKIP, f"{tier} JSON mode not accepted; the client will fall back",
-                 f"{type(e).__name__}: {str(e)[:120]}")
+            report(
+                SKIP,
+                f"{tier} rejects JSON mode; the client will ask for JSON in the prompt instead",
+                f"{type(e).__name__}: {str(e)[:120]}",
+            )
 
 
-async def _sandbox():
-    from .sandbox import NebiusSandboxExecutor
-    ex = NebiusSandboxExecutor()
-    client = ex._make_client()
-    t0 = time.perf_counter()
-    deps = await ex._deps_image(client)
-    line(OK, "sandbox image with numpy + pandas", f"{deps.uuid}, {time.perf_counter() - t0:.1f}s")
-    t0 = time.perf_counter()
-    a = await deps.run(shell="mkdir -p /workspace && echo branch-a > /workspace/x.txt",
-                       disposable=False, timeout=120)
-    b = await a.run(shell="cat /workspace/x.txt && python -c 'import pandas; print(pandas.__version__)'",
-                    disposable=False, timeout=120)
-    blob = await b.read("/workspace/x.txt")
-    line(OK if blob.strip() == b"branch-a" else FAIL, "checkpoint, branch and read back",
-         f"{time.perf_counter() - t0:.1f}s, stdout {str(b.stdout).strip()!r}, "
-         f"cost ${float(b.result.cost or 0):.6f}")
-
-
-def check_sandbox(s) -> None:
-    if not s.nebius_api_key:
-        line(SKIP, "Token Factory Sandboxes", "NEBIUS_API_KEY not set")
-        return
+def check_sandboxes() -> None:
     if not (os.getenv("NEBIUS_PROJECT_ID") or os.getenv("CONTREE_PROJECT")):
-        line(FAIL, "Token Factory Sandboxes", "set NEBIUS_PROJECT_ID (project with sandbox access)")
+        report(
+            FAIL, "Token Factory Sandboxes", "set NEBIUS_PROJECT_ID (a project with sandbox access)"
+        )
         return
-    try:
-        asyncio.run(_sandbox())
-    except Exception as e:
-        line(FAIL, "Token Factory Sandboxes", f"{type(e).__name__}: {e}")
-
-
-def check_tavily(s) -> None:
-    if s.mock_search:
-        line(SKIP, "Tavily", "TAVILY_API_KEY not set")
-        return
-    from tavily import TavilyClient
+    family = FAMILIES["momentum"]
+    prices = synthetic_prices(n_days=300, seed=1)
+    grid = expand_grid(family.param_grid, 6)
+    probes = time_travel_probes(grid)
     try:
         t0 = time.perf_counter()
-        res = TavilyClient(api_key=s.tavily_api_key).search("time series momentum anomaly",
-                                                              max_results=2)
-        line(OK, "Tavily search", f"{len(res.get('results', []))} results, "
-             f"{time.perf_counter() - t0:.1f}s")
+        remote = NebiusSandboxExecutor(n_chunks=2).run(family.code, prices, grid, 5.0, probes)
+        wall = time.perf_counter() - t0
     except Exception as e:
-        line(FAIL, "Tavily search", f"{type(e).__name__}: {e}")
+        report(FAIL, "Token Factory Sandboxes", f"{type(e).__name__}: {e}")
+        return
+    for step in remote.setup:
+        report(PASS, f"sandbox {step['step']}", f"{step['wall_s']:.1f}s")
+
+    local = LocalExecutor(n_chunks=2).run(family.code, prices, grid, 5.0, probes)
+    same = remote.returns.shape == local.returns.shape and np.allclose(
+        remote.returns.to_numpy(), local.returns.to_numpy()
+    )
+    summary = remote.summary()
+    report(
+        PASS if same and not remote.errors else FAIL,
+        f"{summary['branches']} branches in parallel, results identical to a local run",
+        f"{wall:.1f}s end to end, {summary['compute_s_total']:.1f}s compute, "
+        f"${summary['sandbox_cost_usd']:.6f}, errors: {remote.errors or 'none'}",
+    )
+    leak = remote.leak or {}
+    report(
+        PASS if leak and leak == local.leak else FAIL,
+        "time-travel test ran as its own branch",
+        f"{leak.get('checks', 0)} checks, leaked: {leak.get('leaked')}",
+    )
 
 
-def main():
-    s = get_settings()
-    print(f"Base URL: {s.base_url}\n")
-    if check_models(s):
-        check_calls(s)
-    check_sandbox(s)
-    check_tavily(s)
+def check_tavily(settings: Settings) -> None:
+    try:
+        t0 = time.perf_counter()
+        response = TavilyClient(api_key=settings.tavily_api_key).search(
+            "time series momentum anomaly", max_results=2
+        )
+        report(
+            PASS,
+            "Tavily search",
+            f"{len(response.get('results', []))} results, {time.perf_counter() - t0:.1f}s",
+        )
+    except Exception as e:
+        report(FAIL, "Tavily search", f"{type(e).__name__}: {e}")
+
+
+def main() -> None:
+    settings = get_settings()
+    print(f"Token Factory endpoint: {settings.base_url}\n")
+    if settings.mock_llm:
+        report(SKIP, "Token Factory and Sandboxes", "NEBIUS_API_KEY not set")
+    else:
+        llm = LLM(settings)
+        if check_models(settings, llm):
+            check_calls(settings, llm)
+        check_sandboxes()
+    if settings.mock_search:
+        report(SKIP, "Tavily", "TAVILY_API_KEY not set")
+    else:
+        check_tavily(settings)
 
 
 if __name__ == "__main__":

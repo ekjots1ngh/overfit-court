@@ -1,69 +1,76 @@
 """How many genuinely different bets did you make? Random matrix theory answers.
 
 A grid of 63 momentum variants is not 63 independent tries: lookback 60 and
-lookback 90 are nearly the same bet. We compare the correlation spectrum of
-everything tried against the Marchenko-Pastur law (what pure sampling noise
-produces for T observations of N series), remove the correlation noise alone
-would create, and count what is left as effective independent bets.
+lookback 90 are nearly the same bet. To count the real number of bets we look
+at the correlation matrix of everything tried.
+
+Even unrelated strategies show some correlation in a finite sample. The
+Marchenko-Pastur law says how much: for T days and N series of pure noise, the
+eigenvalues of the sample correlation matrix fall inside a known band. Anything
+above the band is real common structure.
+
+`distinct_bets` removes the correlation that sampling noise alone would create
+(an average squared correlation of about 1/(T-1)) and then applies the usual
+effective-number formula N / (1 + (N - 1) * mean squared correlation). N
+identical strategies count as about 1 bet; N independent ones count as about N.
 """
+
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 
 import numpy as np
 
+_FLAT = 1e-12  # columns with a standard deviation below this never trade
+
 
 @dataclass
 class Spectrum:
     n_configs: int
-    n_obs: int
-    q: float                   # N / T
-    distinct_bets: float       # noise-corrected effective number of independent trials
-    eigenvalues: list
-    mp_lower: float
+    n_days: int
+    distinct_bets: float  # noise-corrected effective number of independent bets
+    eigenvalues: list  # of the correlation matrix, largest first
+    mp_lower: float  # Marchenko-Pastur noise band for this N / T
     mp_upper: float
-    n_above_mp: int            # eigenvalues beyond the noise edge (common structure)
-    top_eigen_share: float     # variance share of the largest eigenvalue
+    n_above_noise: int  # eigenvalues above the band: real common structure
+    top_eigen_share: float  # share of all variance in the single biggest factor
 
-    def to_dict(self, include_eigs: bool = False) -> dict:
+    def to_dict(self, include_eigenvalues: bool = False) -> dict:
         d = asdict(self)
-        if not include_eigs:
+        if not include_eigenvalues:
             d.pop("eigenvalues")
         return d
 
 
-def _standardise(M: np.ndarray) -> np.ndarray:
-    M = np.asarray(M, dtype=float)
-    sd = M.std(axis=0, ddof=1)
-    keep = sd > 1e-12
-    X = M[:, keep]
-    return (X - X.mean(axis=0)) / sd[keep]
-
-
-def spectrum(M) -> Spectrum:
-    X = _standardise(M)
-    T, N = X.shape
+def spectrum(returns_matrix) -> Spectrum:
+    """Correlation spectrum, Marchenko-Pastur band and distinct-bet count of a T x N matrix."""
+    M = np.asarray(returns_matrix, dtype=float)
+    M = M[:, M.std(axis=0, ddof=1) > _FLAT]
+    T, N = M.shape
     if N == 0:
-        return Spectrum(0, T, 0.0, 0.0, [], 0.0, 0.0, 0, 0.0)
+        return Spectrum(0, T, 0.0, [], 0.0, 0.0, 0, 0.0)
     if N == 1:
-        return Spectrum(1, T, 1 / T, 1.0, [1.0], 0.0, 0.0, 0, 1.0)
-    C = (X.T @ X) / (T - 1)
-    lam = np.sort(np.linalg.eigvalsh(C))[::-1]
-    lam = np.clip(lam, 0.0, None)
+        return Spectrum(1, T, 1.0, [1.0], 0.0, 0.0, 0, 1.0)
+
+    X = (M - M.mean(axis=0)) / M.std(axis=0, ddof=1)
+    corr = (X.T @ X) / (T - 1)
+    eigenvalues = np.clip(np.sort(np.linalg.eigvalsh(corr))[::-1], 0.0, None)
+
     q = N / T
-    upper = (1 + np.sqrt(q)) ** 2
-    lower = (1 - np.sqrt(q)) ** 2 if q < 1 else 0.0
-    off = C[~np.eye(N, dtype=bool)]
-    rho2 = np.clip(off ** 2 - 1.0 / (T - 1), 0.0, None)   # remove sampling-noise correlation
-    n_eff = N / (1.0 + (N - 1) * rho2.mean())
-    return Spectrum(N, T, float(q), float(n_eff), lam.tolist(), float(lower), float(upper),
-                    int((lam > upper).sum()), float(lam[0] / lam.sum()))
+    mp_upper = (1 + np.sqrt(q)) ** 2
+    mp_lower = (1 - np.sqrt(q)) ** 2 if q < 1 else 0.0
 
+    off_diagonal = corr[~np.eye(N, dtype=bool)]
+    true_rho_sq = np.clip(off_diagonal**2 - 1.0 / (T - 1), 0.0, None)  # remove sampling noise
+    distinct_bets = N / (1.0 + (N - 1) * true_rho_sq.mean())
 
-def mp_density(q: float, n_points: int = 200) -> tuple[np.ndarray, np.ndarray]:
-    """Marchenko-Pastur density for unit-variance noise, ratio q = N/T < 1."""
-    q = min(q, 0.999)
-    lo, hi = (1 - np.sqrt(q)) ** 2, (1 + np.sqrt(q)) ** 2
-    x = np.linspace(lo, hi, n_points)
-    y = np.sqrt(np.clip((hi - x) * (x - lo), 0, None)) / (2 * np.pi * q * x)
-    return x, y
+    return Spectrum(
+        n_configs=N,
+        n_days=T,
+        distinct_bets=float(distinct_bets),
+        eigenvalues=eigenvalues.tolist(),
+        mp_lower=float(mp_lower),
+        mp_upper=float(mp_upper),
+        n_above_noise=int((eigenvalues > mp_upper).sum()),
+        top_eigen_share=float(eigenvalues[0] / eigenvalues.sum()),
+    )

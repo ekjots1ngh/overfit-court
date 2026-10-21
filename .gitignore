@@ -2,8 +2,8 @@
 __pycache__/
 *.pyc
 .pytest_cache/
-report.*
+/report.md
+/report.json
 .overfit_court_sandbox_image
-fishing_results.csv
-*.csv
-!examples/*.csv
+/fishing_results.csv
+/*.csv

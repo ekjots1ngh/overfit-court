@@ -48,4 +48,4 @@ def test_sandboxes_run_the_real_code_path(monkeypatch, capsys, project):
     else:
         assert "[FAIL]" not in out
         assert "branches in parallel, results identical to a local run" in out
-        assert "time-travel test ran as its own branch" in out
+        assert "time-travel test ran in every branch" in out

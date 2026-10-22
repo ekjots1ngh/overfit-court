@@ -13,11 +13,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from . import stats
-from .data import synthetic_prices
+from .data import PLANTED_SIGNAL, synthetic_prices
 from .fishing import Expedition, ScriptedFisherman, run_expedition
 from .library import FAMILIES, spec_for
 from .pipeline import (
-    Judgement,
+    Findings,
     Log,
     Trial,
     drop_flat,
@@ -29,7 +29,10 @@ from .pipeline import (
 )
 from .sandbox import InProcessExecutor, LocalExecutor
 
-FISHING_MARKET = 244  # pure noise; the fisherman "hits" Sharpe 1 after 14 attempts
+# Yes, these markets were cherry-picked: from many seeds, for ones that show each
+# story clearly. The court behaves the same on every market; the experiments in
+# examples/ measure that over many seeds, and those are the numbers in the README.
+FISHING_MARKET = 65  # pure noise on which the scripted fisherman "hits" Sharpe 1
 LEAKY_MARKET = 11  # pure noise
 EDGE_MARKET = 7  # a planted, persistent edge
 STATISTICS_ALONE_SEED = 0xBEEF  # bootstrap seed for act 2's "statistics alone" panel
@@ -38,7 +41,7 @@ ANCHOR_IDEA = "Buy assets trading below their long-run average price and short t
 EDGE_IDEA = "Buy the assets that went up most over the last few months and short the losers."
 
 
-def act_fishing(settings, ledger, executor=None, fisherman=None, log: Log = print) -> Expedition:
+def act_fishing(settings, ledger, *, executor=None, fisherman=None, log: Log = print) -> Expedition:
     """Act 1. The scripted fisherman by default, so the story is reproducible."""
     return run_expedition(
         synthetic_prices(seed=FISHING_MARKET),
@@ -56,12 +59,14 @@ def act_fishing(settings, ledger, executor=None, fisherman=None, log: Log = prin
 
 @dataclass
 class TimeTravelAct:
-    statistics_alone: Judgement  # the leaky draft judged with no time-travel test
+    statistics_alone: Findings  # the leaky draft judged with no time-travel test
     leaky_sharpe_annual: float
     trial: Trial  # the real trial: caught, repaired by Nemotron Super, judged honestly
 
 
-def act_time_travel(settings, ledger, executor=None, log: Log = print, llm=None) -> TimeTravelAct:
+def act_time_travel(
+    settings, ledger, *, executor=None, log: Log = print, llm=None
+) -> TimeTravelAct:
     """Act 2. The court is handed a plausible draft that reads the future."""
     prices = synthetic_prices(seed=LEAKY_MARKET)
     anchor = FAMILIES["anchor"]
@@ -69,16 +74,20 @@ def act_time_travel(settings, ledger, executor=None, log: Log = print, llm=None)
     # What the statistics would say if nobody checked for time travel.
     open_prices, _ = split_sealed(prices)
     grid = expand_grid(anchor.param_grid, settings.max_configs)
-    leaky = InProcessExecutor().run(anchor.code, open_prices, grid, settings.cost_bps)
-    alone = judge_statistics(drop_flat(leaky.returns), leaky.grid, [], STATISTICS_ALONE_SEED, 300)
+    leaky = InProcessExecutor().run(
+        anchor.code, open_prices, grid, settings.cost_bps, time_travel=False
+    )
+    alone = judge_statistics(
+        drop_flat(leaky.returns), leaky.grid, seed=STATISTICS_ALONE_SEED, n_boot=300
+    )
 
     # What the court does: catch it, send it back for repair, judge the honest version.
     trial = run_trial(
         ANCHOR_IDEA,
         prices,
-        settings,
-        ledger,
-        executor or LocalExecutor(),
+        settings=settings,
+        ledger=ledger,
+        executor=executor or LocalExecutor(),
         log=log,
         llm=llm,
         spec=spec_for(anchor),
@@ -87,18 +96,18 @@ def act_time_travel(settings, ledger, executor=None, log: Log = print, llm=None)
     return TimeTravelAct(alone, stats.annualise(alone.best_sharpe), trial)
 
 
-def act_real_edge(settings, ledger, executor=None, log: Log = print, llm=None) -> Trial:
+def act_real_edge(settings, ledger, *, executor=None, log: Log = print, llm=None) -> Trial:
     """Act 3. Nemotron plans and writes the strategy; the winner then faces the sealed evidence."""
     executor = executor or LocalExecutor()
     trial = run_trial(
         EDGE_IDEA,
-        synthetic_prices(seed=EDGE_MARKET, signal=0.0008),
-        settings,
-        ledger,
-        executor,
+        synthetic_prices(seed=EDGE_MARKET, signal=PLANTED_SIGNAL),
+        settings=settings,
+        ledger=ledger,
+        executor=executor,
         log=log,
         llm=llm,
     )
-    if not trial.time_traveller:
-        unseal(trial, executor, ledger, settings, log=log)
+    if trial.passed_time_travel:
+        unseal(trial, executor=executor, log=log)
     return trial

@@ -10,6 +10,7 @@ from overfit_court.library import FAMILIES
 from overfit_court.llm import LLM
 from overfit_court.pipeline import run_trial, unseal
 from overfit_court.sandbox import LocalExecutor
+from overfit_court.stats import CONFIRMED, CONVICTED
 
 PLAN = """<think>The user wants reversion to a long-run anchor. Two parameters.</think>
 Here is the spec:
@@ -19,7 +20,7 @@ Here is the spec:
  "search_queries": ["mean reversion long run average"], "known_risks": ["regime change"]}
 ```"""
 JUDGEMENT = {
-    "headline": "Verdict explained",
+    "headline": "The verdict, explained",
     "reasoning": ["a", "b", "c"],
     "what_would_change_my_mind": ["x", "y"],
 }
@@ -50,7 +51,7 @@ def test_a_full_trial_through_a_live_like_model_and_the_real_subprocess_harness(
     trial = run_trial(
         "buy assets below their long-run average",
         synthetic_prices(seed=4),
-        settings,
+        settings=settings,
         executor=LocalExecutor(),
         llm=LLM(settings, client=fake),
         log=silent,
@@ -64,4 +65,6 @@ def test_a_full_trial_through_a_live_like_model_and_the_real_subprocess_harness(
     assert trial.opinion == JUDGEMENT
     assert len(trial.cost_table) == len(fake.requests)
     assert sum(call["cost_usd"] for call in trial.cost_table) > 0
-    assert unseal(trial, LocalExecutor(), settings=settings, log=silent).verdict
+    assert trial.verdict == CONVICTED  # pure noise: the honest version has no edge
+    sealed = unseal(trial, executor=LocalExecutor(), log=silent)
+    assert sealed.verdict != CONFIRMED and sealed.committed_params == trial.findings.best_params

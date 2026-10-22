@@ -7,15 +7,16 @@ so the whole pipeline can be developed, tested and demoed offline.
 Live models misbehave in predictable ways, and each is handled here instead
 of crashing a trial:
 
-- a model rejects response_format (JSON mode): retry once without it, ask for
-  JSON in the prompt instead, and remember not to send it to that model again;
+- a request in JSON mode is rejected: retry once without response_format,
+  asking for JSON in the prompt instead. If that works, the model doesn't
+  support JSON mode, so it is never sent to that model again;
 - a reasoning model spends its whole token budget thinking and returns nothing
   usable: retry once with four times the budget;
 - reasoning arrives inline as <think>...</think>, or unclosed: stripped;
 - the reply is not valid JSON: ask once more, quoting the parse error;
 - rate limits, timeouts and server errors: the SDK retries with backoff.
 
-Every request that reaches the API, retries included, is logged with its
+Every request, retries and failures included, is logged in `calls` with its
 tokens, latency and cost.
 """
 
@@ -52,7 +53,7 @@ class Call:
     output_tokens: int
     latency_s: float
     cost_usd: float
-    note: str = ""  # why this request was a retry, if it was
+    note: str = ""  # why this request was a retry, or why it failed
 
 
 class LLM:
@@ -65,7 +66,7 @@ class LLM:
     def __init__(self, settings: Settings, client=None):
         self.settings = settings
         self.mock = settings.mock_llm and client is None
-        self.ledger: list[Call] = []
+        self.calls: list[Call] = []
         self._rejects_json_mode: set[str] = set()  # models that refused response_format
         self.client = client
         if not self.mock and self.client is None:
@@ -92,7 +93,7 @@ class LLM:
         """Ask the `tier` model; return its answer with any reasoning stripped."""
         model = self.settings.models[tier]
         if self.mock:
-            self.ledger.append(Call(role, tier, f"{model} (mock)", 0, 0, 0.0, 0.0))
+            self.calls.append(Call(role, tier, f"{model} (mock)", 0, 0, 0.0, 0.0))
             return mock()
 
         use_json_mode = json_mode and model not in self._rejects_json_mode
@@ -108,13 +109,15 @@ class LLM:
         except Exception as e:
             if not (use_json_mode and _is_bad_request(e)):
                 raise
-            # This model doesn't accept response_format: ask for JSON in the prompt instead.
-            self._rejects_json_mode.add(model)
+            # Perhaps this model doesn't accept response_format: ask in the prompt instead.
+            # If the retry fails too, the request itself was the problem, and that error
+            # is raised; only if it succeeds is the model marked as rejecting JSON mode.
             messages[0]["content"] = system + JSON_ONLY
             use_json_mode = False
             raw, finish_reason = self._send(
                 **request, max_tokens=max_tokens, json_mode=False, note="retry without JSON mode"
             )
+            self._rejects_json_mode.add(model)
 
         answer = strip_reasoning(raw)
         if not answer and max_tokens < MAX_TOKENS_CAP:
@@ -151,10 +154,10 @@ class LLM:
             )
 
     def cost_table(self) -> list[dict]:
-        return [asdict(call) for call in self.ledger]
+        return [asdict(call) for call in self.calls]
 
     def total_cost(self) -> float:
-        return sum(call.cost_usd for call in self.ledger)
+        return sum(call.cost_usd for call in self.calls)
 
     def _send(
         self,
@@ -167,22 +170,32 @@ class LLM:
         json_mode: bool,
         note: str = "",
     ) -> tuple[str, str | None]:
-        """One request to Token Factory. Returns (raw content, finish reason) and logs the call."""
+        """One request to Token Factory. Returns (raw content, finish reason) and logs the call.
+
+        A request that fails is logged too (with no tokens), then the error is raised.
+        """
         model = self.settings.models[tier]
         options = {"response_format": {"type": "json_object"}} if json_mode else {}
         start = time.perf_counter()
-        response = self.client.chat.completions.create(
-            model=model,
-            messages=messages,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            **options,
-        )
+        try:
+            response = self.client.chat.completions.create(
+                model=model,
+                messages=messages,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                **options,
+            )
+        except Exception as e:
+            failure = f"failed: {type(e).__name__}: {e}"[:300]
+            latency = round(time.perf_counter() - start, 3)
+            note = f"{note}; {failure}" if note else failure
+            self.calls.append(Call(role, tier, model, 0, 0, latency, 0.0, note))
+            raise
         usage = getattr(response, "usage", None)
         input_tokens = getattr(usage, "prompt_tokens", 0) or 0
         output_tokens = getattr(usage, "completion_tokens", 0) or 0
-        price_in, price_out = self.settings.prices[tier]  # USD per million tokens
-        self.ledger.append(
+        price_in, price_out = self.settings.token_prices[tier]  # USD per million tokens
+        self.calls.append(
             Call(
                 role=role,
                 tier=tier,

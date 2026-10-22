@@ -16,7 +16,7 @@ import os
 import sys
 from pathlib import Path
 
-from .data import load_csv, synthetic_prices
+from .data import PLANTED_SIGNAL, load_csv, synthetic_prices
 from .fishing import run_expedition
 from .ledger import Ledger, record_key
 from .pipeline import SEALED_FRACTION, run_trial, unseal
@@ -37,7 +37,7 @@ def _prices_and_ledger(args):
     if args.csv:
         prices = load_csv(args.csv)
     else:
-        prices = synthetic_prices(seed=args.seed, signal=0.0008 if args.planted else 0.0)
+        prices = synthetic_prices(seed=args.seed, signal=PLANTED_SIGNAL if args.planted else 0.0)
     ledger = Ledger(args.ledger)
     if args.forget:
         ledger.clear(record_key(prices, SEALED_FRACTION))
@@ -54,8 +54,8 @@ def trial_command(argv: list[str]) -> None:
 
     prices, ledger = _prices_and_ledger(args)
     trial = run_trial(args.idea, prices, ledger=ledger)
-    if args.unseal and not trial.time_traveller:
-        unseal(trial, ledger=ledger)
+    if args.unseal and trial.passed_time_travel:
+        unseal(trial)
     markdown = court_record_markdown(trial)
     Path(f"{args.out}.md").write_text(markdown)
     Path(f"{args.out}.json").write_text(trial.to_json())
@@ -70,7 +70,9 @@ def fish_command(argv: list[str]) -> None:
     args = parser.parse_args(argv)
 
     prices, ledger = _prices_and_ledger(args)
-    expedition = run_expedition(prices, args.target, args.attempts, ledger=ledger, seed=args.seed)
+    expedition = run_expedition(
+        prices, target=args.target, max_attempts=args.attempts, ledger=ledger, seed=args.seed
+    )
     print(json.dumps(expedition.summary(), indent=2, default=str))
 
 

@@ -16,11 +16,11 @@ import time
 from collections import Counter
 
 from overfit_court.config import get_settings
-from overfit_court.data import synthetic_prices
+from overfit_court.data import PLANTED_SIGNAL, synthetic_prices
 from overfit_court.pipeline import run_trial, unseal
 from overfit_court.sandbox import InProcessExecutor
 
-PLANTED_EDGE = {"none (noise)": 0.0, "weak": 0.0004, "strong": 0.0008}
+PLANTED_EDGE = {"none (noise)": 0.0, "weak": PLANTED_SIGNAL / 2, "strong": PLANTED_SIGNAL}
 IDEA = "buy recent winners, short losers"
 
 
@@ -45,8 +45,8 @@ def main(n_seeds: int) -> None:
         verdicts, sealed_verdicts, open_sharpes, sealed_sharpes = Counter(), Counter(), [], []
         for seed in range(n_seeds):
             prices = synthetic_prices(signal=signal, seed=100 + seed)
-            trial = run_trial(IDEA, prices, settings, executor=executor, log=silent)
-            sealed = unseal(trial, executor, settings=settings, log=silent)
+            trial = run_trial(IDEA, prices, settings=settings, executor=executor, log=silent)
+            sealed = unseal(trial, executor=executor, log=silent)
             verdicts[trial.verdict] += 1
             sealed_verdicts[sealed.verdict] += 1
             open_sharpes.append(trial.evidence()["best_sharpe_annual"])

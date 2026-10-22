@@ -14,6 +14,7 @@ prices up to day t only. The harness lags them by a day and charges costs.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 
 
@@ -22,7 +23,7 @@ class Family:
     name: str  # short identifier, e.g. "momentum"
     title: str  # human-readable name
     hypothesis: str  # the effect the strategy bets on
-    keywords: tuple  # demo mode routes an idea here if it contains one of these
+    keywords: tuple  # demo mode routes an idea here if it contains one of these words
     param_grid: dict  # parameter name -> values to try
     code: str  # source defining positions(prices, **params)
     search_queries: tuple = ()  # prior-art searches for this effect
@@ -297,10 +298,14 @@ DEFAULT = "momentum"
 
 
 def route(idea: str) -> Family:
-    """Demo mode: the first family with a keyword in the idea (most specific families first)."""
+    """Demo mode: the first family with a keyword in the idea (most specific families first).
+
+    Keywords match whole words, optionally plural: "mondays" finds "monday",
+    but "small" does not find "sma" and "systematic" does not find "ema".
+    """
     text = idea.lower()
     for family in _ALL:
-        if any(keyword in text for keyword in family.keywords):
+        if any(re.search(rf"\b{re.escape(k)}s?\b", text) for k in family.keywords):
             return family
     return FAMILIES[DEFAULT]
 

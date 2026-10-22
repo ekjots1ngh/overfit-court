@@ -47,20 +47,37 @@ def test_min_track_record_needs_longer_for_a_thinner_edge():
 
 
 @pytest.mark.parametrize(
-    ("p_real", "walk_forward", "oos_loss", "expected"),
+    ("p_value", "walk_forward", "oos_loss", "expected"),
     [
-        (0.30, 1.0, 0.10, CONVICTED),  # luck explains it
-        (0.99, -0.2, 0.10, CONVICTED),  # loses money chosen walk-forward
-        (0.99, 1.0, 0.60, CONVICTED),  # the in-sample winner loses out of sample
-        (0.99, 1.0, 0.05, ACQUITTED),
-        (0.90, 1.0, 0.05, HUNG_JURY),  # promising, not proven
+        (0.70, 1.0, 0.10, CONVICTED),  # luck explains it
+        (0.01, -0.2, 0.10, CONVICTED),  # loses money chosen walk-forward
+        (0.01, 1.0, 0.60, CONVICTED),  # the in-sample winner loses out of sample
+        (0.01, 1.0, 0.05, ACQUITTED),
+        (0.05, 1.0, 0.05, ACQUITTED),  # the 5% level itself passes
+        (0.10, 1.0, 0.05, HUNG_JURY),  # promising, not proven
+        (0.01, 1.0, 0.30, HUNG_JURY),
     ],
 )
-def test_verdict_rules(p_real, walk_forward, oos_loss, expected):
-    assert stats.verdict_from_stats(p_real, walk_forward, oos_loss) == expected
+def test_verdict_rules(p_value, walk_forward, oos_loss, expected):
+    assert stats.verdict_from_stats(p_value, walk_forward, oos_loss) == expected
 
 
-def test_probabilities_are_never_rounded_to_certainty():
-    assert stats.fmt_prob(0.997) == "over 99%"
-    assert stats.fmt_prob(0.001) == "under 1%"
-    assert stats.fmt_prob(0.42) == "42%"
+def test_p_values_are_shown_precisely_near_the_threshold():
+    assert stats.fmt_p(0.0499) == "p = 0.050"
+    assert stats.fmt_p(0.0519) == "p = 0.052"
+    assert stats.fmt_p(0.0004) == "p < 0.001"
+    assert stats.fmt_p(0.62) == "p = 0.62"
+    assert stats.fmt_p(0.62, label=False) == "0.62"
+
+
+def test_track_records_are_shown_readably():
+    assert stats.fmt_years(None) == "never"
+    assert stats.fmt_years(6234.6) == "over 100"
+    assert stats.fmt_years(1.04) == "1.0"
+
+
+def test_walk_forward_keeps_what_it_earned():
+    M = np.random.default_rng(5).normal(0, 0.01, size=(600, 4))
+    result = stats.walk_forward(M, n_folds=6)
+    assert len(result.returns) == 500  # every fold after the first
+    assert result.oos_sharpe_annual == pytest.approx(stats.annualise(stats.sharpe(result.returns)))

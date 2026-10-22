@@ -7,8 +7,8 @@ Checks, in order:
 2. One real call per tier, with latency, tokens and cost; and whether each tier
    accepts JSON mode (if not, the client falls back to asking in the prompt).
 3. Token Factory Sandboxes: a real small job through the real code path
-   (dependencies image, trial checkpoint, parallel branches, time-travel
-   branch, results read back), compared against the same job run locally.
+   (dependencies image, trial checkpoint, parallel branches, each with the
+   time-travel test, results read back), compared with the same job run locally.
 4. Tavily: one search.
 """
 
@@ -20,11 +20,12 @@ import time
 import numpy as np
 from tavily import TavilyClient
 
+from . import _harness
 from .config import Settings, get_settings
 from .data import synthetic_prices
 from .library import FAMILIES
 from .llm import LLM
-from .pipeline import expand_grid, time_travel_probes
+from .pipeline import expand_grid
 from .sandbox import LocalExecutor, NebiusSandboxExecutor
 
 PASS, FAIL, SKIP = "PASS", "FAIL", "SKIP"
@@ -70,7 +71,7 @@ def check_calls(settings: Settings, llm: LLM) -> None:
                 mock=lambda: "ready",
                 max_tokens=400,
             )
-            call = llm.ledger[-1]
+            call = llm.calls[-1]
             report(
                 PASS,
                 f"{tier} call",
@@ -106,10 +107,9 @@ def check_sandboxes() -> None:
     family = FAMILIES["momentum"]
     prices = synthetic_prices(n_days=300, seed=1)
     grid = expand_grid(family.param_grid, 6)
-    probes = time_travel_probes(grid)
     try:
         t0 = time.perf_counter()
-        remote = NebiusSandboxExecutor(n_chunks=2).run(family.code, prices, grid, 5.0, probes)
+        remote = NebiusSandboxExecutor(n_chunks=2).run(family.code, prices, grid, 5.0)
         wall = time.perf_counter() - t0
     except Exception as e:
         report(FAIL, "Token Factory Sandboxes", f"{type(e).__name__}: {e}")
@@ -117,7 +117,7 @@ def check_sandboxes() -> None:
     for step in remote.setup:
         report(PASS, f"sandbox {step['step']}", f"{step['wall_s']:.1f}s")
 
-    local = LocalExecutor(n_chunks=2).run(family.code, prices, grid, 5.0, probes)
+    local = LocalExecutor(n_chunks=2).run(family.code, prices, grid, 5.0)
     same = remote.returns.shape == local.returns.shape and np.allclose(
         remote.returns.to_numpy(), local.returns.to_numpy()
     )
@@ -128,11 +128,12 @@ def check_sandboxes() -> None:
         f"{wall:.1f}s end to end, {summary['compute_s_total']:.1f}s compute, "
         f"${summary['sandbox_cost_usd']:.6f}, errors: {remote.errors or 'none'}",
     )
-    leak = remote.leak or {}
+    checks = remote.time_travel or {}
     report(
-        PASS if leak and leak == local.leak else FAIL,
-        "time-travel test ran as its own branch",
-        f"{leak.get('checks', 0)} checks, leaked: {leak.get('leaked')}",
+        PASS if _harness.passed(checks) and checks == local.time_travel else FAIL,
+        "time-travel test ran in every branch, same result as locally",
+        f"{checks.get('checks', 0)} checks of {checks.get('configs', 0)} configurations: "
+        f"{checks.get('status', 'did not run')}",
     )
 
 

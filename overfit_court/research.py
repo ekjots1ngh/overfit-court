@@ -1,4 +1,8 @@
-"""Prior-art search with Tavily: has this "edge" already been published, and so arbitraged?"""
+"""Prior-art search with Tavily: has this "edge" already been published, and so arbitraged?
+
+Prior art is context, not evidence: it never changes a verdict. So a failed
+search is reported and the trial carries on.
+"""
 
 from __future__ import annotations
 
@@ -7,26 +11,26 @@ from tavily import TavilyClient
 from .config import Settings
 
 
-def prior_art(queries: list[str], settings: Settings, max_results: int = 4) -> list[dict]:
-    """Search for each query (at most three) and return the hits.
+def prior_art(
+    queries: list[str], settings: Settings, max_results: int = 4
+) -> tuple[list[dict], str | None]:
+    """Search for each query (at most three).
 
-    Without a Tavily key this returns a single placeholder with no URL, which
-    the clerk recognises as "no live search was run".
+    Returns (hits, note). `note` explains why there are no live results when
+    there aren't any: demo mode, no queries, or the search failing.
     """
-    if settings.mock_search or not queries:
-        return [
-            {
-                "query": q,
-                "title": "(demo mode) set TAVILY_API_KEY for live prior-art search",
-                "url": "",
-                "content": "",
-            }
-            for q in queries[:1]
-        ]
+    if settings.mock_search:
+        return [], "No live prior-art search was run (set TAVILY_API_KEY to enable it)."
+    if not queries:
+        return [], "The plan had no prior-art search queries."
     client = TavilyClient(api_key=settings.tavily_api_key)
-    hits = []
+    hits, failures = [], []
     for query in queries[:3]:
-        response = client.search(query, max_results=max_results, search_depth="basic")
+        try:
+            response = client.search(query, max_results=max_results, search_depth="basic")
+        except Exception as e:  # a search outage must not stop the trial
+            failures.append(f"{type(e).__name__}: {e}"[:200])
+            continue
         for result in response.get("results", []):
             hits.append(
                 {
@@ -36,4 +40,7 @@ def prior_art(queries: list[str], settings: Settings, max_results: int = 4) -> l
                     "content": (result.get("content") or "")[:600],
                 }
             )
-    return hits
+    note = None
+    if not hits:
+        note = f"The prior-art search failed: {failures[0]}" if failures else "Nothing was found."
+    return hits, note

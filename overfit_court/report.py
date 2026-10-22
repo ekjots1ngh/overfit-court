@@ -11,15 +11,24 @@ import hashlib
 import html
 from datetime import datetime, timezone
 
-from .stats import fmt_prob
+from .stats import (
+    ACQUITTED,
+    CONFIRMED,
+    CONVICTED,
+    HUNG_JURY,
+    INCONCLUSIVE,
+    REFUTED,
+    fmt_p,
+    fmt_years,
+)
 
 VERDICT_COLOURS = {
-    "CONVICTED": "#b91c1c",
-    "HUNG JURY": "#b45309",
-    "ACQUITTED": "#15803d",
-    "REFUTED": "#b91c1c",
-    "INCONCLUSIVE": "#b45309",
-    "CONFIRMED": "#15803d",
+    CONVICTED: "#b91c1c",
+    HUNG_JURY: "#b45309",
+    ACQUITTED: "#15803d",
+    REFUTED: "#b91c1c",
+    INCONCLUSIVE: "#b45309",
+    CONFIRMED: "#15803d",
 }
 
 
@@ -30,10 +39,11 @@ def _summary_rows(trial) -> list[tuple[str, str]]:
     return [
         ("Idea", trial.idea),
         ("Strategy", trial.spec.get("name", "")),
+        ("Data", trial.data_source),
         ("Trial number on this data", str(e["trial_number_on_this_data"])),
         (
-            "Configurations tried (this trial / whole record)",
-            f"{e['n_configs']} / {e['n_configs_total_on_this_data']}",
+            "Configurations: this trial / distinct on this data",
+            f"{e['n_configs']} / {e['n_distinct_configs_on_this_data']}",
         ),
         (
             "Distinct bets, random matrix theory (this trial / whole record)",
@@ -41,27 +51,28 @@ def _summary_rows(trial) -> list[tuple[str, str]]:
         ),
         ("Best backtest Sharpe (open evidence)", f"{e['best_sharpe_annual']:.2f}"),
         ("Best Sharpe luck alone would give", f"{e['luck_sharpe_annual']:.2f}"),
-        ("Probability the edge is real", fmt_prob(e["p_real"])),
+        ("Reality Check against everything tried", fmt_p(e["p_value"])),
         ("In-sample winner loses out of sample", f"{e['prob_oos_loss']:.0%} of splits"),
         ("Walk-forward Sharpe", f"{e['walk_forward_sharpe']:.2f}"),
         (
-            "Years of live trading to prove it",
-            "never at this Sharpe" if years is None else str(years),
+            "Years of live trading to prove it (at the walk-forward Sharpe)",
+            "never: it loses money walk-forward" if years is None else fmt_years(years),
         ),
+        ("Trading cost", f"{trial.cost_bps:g} bps per unit of turnover"),
         ("Time-travel test", e["time_travel"]),
         ("Failed checks", "; ".join(e["failed_checks"]) or "none"),
         ("Best parameters", str(e["best_params"])),
-        ("Strategy code hash", hashlib.sha256(trial.code.encode()).hexdigest()[:16]),
+        ("Strategy code (SHA-256)", hashlib.sha256(trial.code.encode()).hexdigest()),
     ]
 
 
 def _sealed_rows(sealed) -> list[tuple[str, str]]:
     return [
-        ("Commitment (hash of code + parameters + data)", sealed.commitment),
+        ("Commitment (SHA-256 of code, parameters, data, costs, harness)", sealed.commitment),
         ("Sealed period", f"{sealed.sealed_days} days from {sealed.sealed_from}"),
         ("Sharpe on open evidence", f"{sealed.open_sharpe_annual:.2f}"),
         ("Sharpe on sealed evidence", f"{sealed.sealed_sharpe_annual:.2f}"),
-        ("Probability real (corrected for earlier openings)", fmt_prob(sealed.p_real)),
+        ("Test of Sharpe above zero (corrected for earlier openings)", fmt_p(sealed.p_value)),
         ("Earlier openings of this seal", str(sealed.times_opened_before)),
     ]
 
@@ -112,7 +123,7 @@ h1 { margin: 0 0 .25rem; }
 .sub { color: var(--muted); margin: 0 0 1.5rem; }
 table { width: 100%; border-collapse: collapse; margin: .5rem 0 1.5rem; }
 th, td { text-align: left; padding: .45rem .5rem; border-bottom: 1px solid var(--line);
-         vertical-align: top; }
+         vertical-align: top; overflow-wrap: anywhere; }
 th { font-weight: 500; color: var(--muted); width: 45%; }
 footer { color: var(--muted); font-size: .85rem; margin-top: 2rem; }
 """

@@ -7,12 +7,17 @@ column per strategy configuration that was tried.
 
 Contents, in the order a trial uses them:
 
-1. Sharpe basics             sharpe, annualise
+1. Basics                    sharpe, annualise, distinct_columns
 2. Sharpe inference          probabilistic_sharpe_ratio, expected_max_sharpe,
                              deflated_sharpe_ratio, min_track_record_years
 3. The Reality Check         reality_check (the court's main test of luck)
 4. Overfitting diagnostics   pbo_cscv, walk_forward
-5. The ruling                verdict_from_stats, verdict_reasons, fmt_prob
+5. The ruling                verdict_from_stats, verdict_reasons, fmt_years, fmt_p
+
+A note on p-values. The Reality Check's p-value is the share of bootstrap
+resamples in which zero-edge versions of everything tried do at least as well
+as the configuration picked. Small means luck struggles to explain the result.
+It is not the probability that the strategy is real, and nothing here says so.
 
 References
 - Bailey & Lopez de Prado (2012), "The Sharpe Ratio Efficient Frontier"
@@ -27,7 +32,7 @@ References
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from itertools import combinations
 
 import numpy as np
@@ -35,7 +40,7 @@ from scipy import stats as st
 
 PERIODS_PER_YEAR = 252
 EULER_GAMMA = 0.5772156649015329
-_FLAT = 1e-12  # a standard deviation below this means "never trades"
+FLAT = 1e-12  # a configuration whose returns vary less than this never trades
 
 # Verdicts on the open evidence...
 CONVICTED, HUNG_JURY, ACQUITTED = "CONVICTED", "HUNG JURY", "ACQUITTED"
@@ -43,14 +48,14 @@ CONVICTED, HUNG_JURY, ACQUITTED = "CONVICTED", "HUNG JURY", "ACQUITTED"
 CONFIRMED, INCONCLUSIVE, REFUTED = "CONFIRMED", "INCONCLUSIVE", "REFUTED"
 
 # The thresholds behind the ruling (see verdict_from_stats).
-P_REAL_TO_ACQUIT = 0.95  # Reality Check: at least 95% sure the edge is not luck
-P_REAL_TO_CONVICT = 0.50  # below this, luck is the better explanation
+P_VALUE_TO_ACQUIT = 0.05  # Reality Check: luck matches the result at most 5% of the time
+P_VALUE_TO_CONVICT = 0.50  # luck matches it more often than not: luck is the better explanation
 OOS_LOSS_TO_CONVICT = 0.50  # the in-sample winner loses out of sample in most splits
 OOS_LOSS_TO_ACQUIT = 0.20
-P_REAL_TO_CONFIRM = 0.95  # sealed evidence: one pre-registered test at the 5% level
+P_VALUE_TO_CONFIRM = 0.05  # sealed evidence: one pre-registered test at the 5% level
 
 
-# --- 1. Sharpe basics ---
+# --- 1. Basics ---
 def sharpe(returns) -> float:
     """Per-period (not annualised) Sharpe ratio; 0 for a series that never moves."""
     r = np.asarray(returns, dtype=float)
@@ -67,14 +72,28 @@ def annualise(sr: float, periods: int = PERIODS_PER_YEAR) -> float:
     return float(sr * math.sqrt(periods))
 
 
+def distinct_columns(returns_matrix) -> np.ndarray:
+    """The matrix with exact repeats of a column removed (first occurrences kept, in order).
+
+    Running the same configuration twice is not two pieces of research. Columns
+    are compared at float32 precision, the precision the court record stores.
+    """
+    M = np.asarray(returns_matrix, dtype=float)
+    if M.shape[1] < 2:
+        return M
+    _, first = np.unique(M.astype(np.float32), axis=1, return_index=True)
+    return M[:, np.sort(first)]
+
+
 # --- 2. Sharpe inference ---
 def probabilistic_sharpe_ratio(
     sr: float, sr_benchmark: float, n_obs: int, skew: float = 0.0, kurt: float = 3.0
 ) -> float:
-    """Probability that the true Sharpe beats `sr_benchmark`, given an observed `sr`.
+    """Confidence that the true Sharpe beats `sr_benchmark`, given an observed `sr`.
 
-    Adjusts the standard error of the Sharpe ratio for skewed, fat-tailed
-    returns. `kurt` is raw kurtosis (3.0 for a normal distribution).
+    One minus this is the one-sided p-value of the test "true Sharpe is no more
+    than the benchmark". Adjusts the standard error of the Sharpe ratio for
+    skewed, fat-tailed returns; `kurt` is raw kurtosis (3.0 for a normal).
     """
     if n_obs < 2:
         return 0.5
@@ -96,7 +115,7 @@ def expected_max_sharpe(var_sr: float, n_trials: int) -> float:
 
 
 def deflated_sharpe_ratio(returns, trial_sharpes, n_trials: int | None = None) -> float:
-    """Probability the chosen strategy's Sharpe survives the number of trials run.
+    """Confidence that the chosen strategy's Sharpe survives the number of trials run.
 
     The analytic version from Bailey & Lopez de Prado (2014). It assumes the
     trials are independent, so pass `n_trials` (for example the number of
@@ -122,11 +141,11 @@ def min_track_record_years(
     confidence: float = 0.95,
     periods: int = PERIODS_PER_YEAR,
 ) -> float | None:
-    """Years of live trading needed to be `confidence` sure the true Sharpe beats the benchmark.
+    """Years of daily returns needed to be `confidence` sure the true Sharpe beats the benchmark.
 
     The minimum track record length of Bailey & Lopez de Prado (2012). Returns
-    None when the observed Sharpe does not beat the benchmark at all: then no
-    amount of live data would confirm it.
+    None when the Sharpe does not beat the benchmark at all: then no amount of
+    data would confirm it.
     """
     if sr <= sr_benchmark:
         return None
@@ -139,8 +158,7 @@ def min_track_record_years(
 # --- 3. The Reality Check ---
 @dataclass
 class RealityCheckResult:
-    p_value: float  # P(the best of everything tried looks this good with zero edge)
-    p_real: float  # 1 - p_value: the probability the edge is real
+    p_value: float  # share of resamples where zero-edge versions of everything do as well
     null_median: float  # the best Sharpe luck alone typically produces (per day)
     null_median_annual: float
     null_q95_annual: float  # luck gets this far one time in twenty
@@ -181,7 +199,7 @@ def reality_check(
     `pick_sharpe` is the per-day Sharpe of the chosen strategy on the original data.
     """
     M = np.asarray(returns_matrix, dtype=float)
-    M = M[:, M.std(axis=0, ddof=1) > _FLAT]
+    M = M[:, M.std(axis=0, ddof=1) > FLAT]
     T, N = M.shape
     edgeless = M - M.mean(axis=0)
     rng = np.random.default_rng(seed)
@@ -193,11 +211,9 @@ def reality_check(
         mu, sd = R.mean(axis=0), R.std(axis=0, ddof=1)
         best_by_luck[b] = np.max(np.divide(mu, sd, out=np.zeros_like(mu), where=sd > 0))
 
-    p_value = float((1 + np.sum(best_by_luck >= pick_sharpe)) / (n_boot + 1))
     median = float(np.median(best_by_luck))
     return RealityCheckResult(
-        p_value=p_value,
-        p_real=1.0 - p_value,
+        p_value=float((1 + np.sum(best_by_luck >= pick_sharpe)) / (n_boot + 1)),
         null_median=median,
         null_median_annual=annualise(median),
         null_q95_annual=annualise(float(np.quantile(best_by_luck, 0.95))),
@@ -279,6 +295,7 @@ class WalkForwardResult:
     oos_sharpe_annual: float  # the Sharpe you would actually have earned
     selected_columns: list  # which configuration was picked for each fold
     n_folds: int
+    returns: np.ndarray = field(repr=False, default_factory=lambda: np.zeros(0))  # what it earned
 
 
 def walk_forward(returns_matrix, n_folds: int = 6) -> WalkForwardResult:
@@ -296,16 +313,17 @@ def walk_forward(returns_matrix, n_folds: int = 6) -> WalkForwardResult:
         choice = int(np.argmax([sharpe(history[:, j]) for j in range(M.shape[1])]))
         picks.append(choice)
         earned.extend(M[bounds[k] : bounds[k + 1], choice])
-    return WalkForwardResult(annualise(sharpe(earned)), picks, n_folds)
+    earned = np.array(earned)
+    return WalkForwardResult(annualise(sharpe(earned)), picks, n_folds, earned)
 
 
 # --- 5. The ruling ---
-def verdict_from_stats(p_real: float, wf_sharpe_annual: float, prob_oos_loss: float) -> str:
+def verdict_from_stats(p_value: float, wf_sharpe_annual: float, prob_oos_loss: float) -> str:
     """The court's ruling. Deterministic: the judge model explains it but cannot change it.
 
     Convicted if any check clearly fails, acquitted only if all clearly pass:
 
-    - p_real: Reality Check over every configuration tried. Fishing lowers it.
+    - p_value: Reality Check over every configuration tried. Fishing raises it.
     - wf_sharpe_annual: the Sharpe earned when the choice is made walk-forward.
     - prob_oos_loss: how often the in-sample winner loses money out of sample.
 
@@ -313,18 +331,22 @@ def verdict_from_stats(p_real: float, wf_sharpe_annual: float, prob_oos_loss: fl
     profitable, which one wins in sample is random, so PBO sits near 50% even
     though nothing is wrong (we found this on known-truth markets).
     """
-    if p_real < P_REAL_TO_CONVICT or wf_sharpe_annual <= 0 or prob_oos_loss >= OOS_LOSS_TO_CONVICT:
+    if (
+        p_value > P_VALUE_TO_CONVICT
+        or wf_sharpe_annual <= 0
+        or prob_oos_loss >= OOS_LOSS_TO_CONVICT
+    ):
         return CONVICTED
-    if p_real >= P_REAL_TO_ACQUIT and prob_oos_loss < OOS_LOSS_TO_ACQUIT:
+    if p_value <= P_VALUE_TO_ACQUIT and prob_oos_loss < OOS_LOSS_TO_ACQUIT:
         return ACQUITTED
     return HUNG_JURY
 
 
-def verdict_reasons(p_real: float, wf_sharpe_annual: float, prob_oos_loss: float) -> list[str]:
+def verdict_reasons(p_value: float, wf_sharpe_annual: float, prob_oos_loss: float) -> list[str]:
     """The checks that clearly failed, in plain words (empty if none did)."""
     reasons = []
-    if p_real < P_REAL_TO_CONVICT:
-        reasons.append(f"luck explains it (P(real) {fmt_prob(p_real)})")
+    if p_value > P_VALUE_TO_CONVICT:
+        reasons.append(f"luck explains it ({fmt_p(p_value)})")
     if wf_sharpe_annual <= 0:
         reasons.append(f"chosen walk-forward it loses money (Sharpe {wf_sharpe_annual:.2f})")
     if prob_oos_loss >= OOS_LOSS_TO_CONVICT:
@@ -332,10 +354,19 @@ def verdict_reasons(p_real: float, wf_sharpe_annual: float, prob_oos_loss: float
     return reasons
 
 
-def fmt_prob(p: float) -> str:
-    """Format a probability without ever rounding it to certainty (99.7% is not 100%)."""
-    if p >= 0.995:
-        return "over 99%"
-    if p <= 0.005:
-        return "under 1%"
-    return f"{p:.0%}"
+def fmt_years(years: float | None) -> str:
+    """A minimum track record for display: "never" if no record would do, capped at "over 100"."""
+    if years is None:
+        return "never"
+    return "over 100" if years > 100 else f"{years:.1f}"
+
+
+def fmt_p(p: float, *, label: bool = True) -> str:
+    """A p-value for display: "p = 0.023" (or "0.023" without the label).
+
+    Three decimals below 0.1, so that 0.049 and 0.051 stay apart.
+    """
+    if p < 0.001:
+        return "p < 0.001" if label else "< 0.001"
+    value = f"{p:.3f}" if p < 0.1 else f"{p:.2f}"
+    return f"p = {value}" if label else value

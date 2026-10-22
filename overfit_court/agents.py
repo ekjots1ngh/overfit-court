@@ -8,18 +8,32 @@
 
 None of them decides anything that matters. The verdict comes from `stats`;
 look-ahead bias is caught by the harness's time-travel test; the judge may
-only explain. Each call also supplies a `mock`: the reply used in demo mode,
-when no API key is set, built from the strategy library.
+only explain. Every reply is checked and normalised before it is used, because
+a live model can return the wrong types, an unknown risk level, citations it
+was never given, or a headline that contradicts the verdict.
+
+Each call also supplies a `mock`: the reply used in demo mode, when no API key
+is set, built from the strategy library.
 """
 
 from __future__ import annotations
 
 import json
+import math
 import re
 
 from . import library
+from ._harness import LEAKED, PASSED
 from .llm import LLM, extract_code
-from .stats import fmt_prob
+from .stats import ACQUITTED, CONVICTED, HUNG_JURY, fmt_p
+
+
+def _strings(value, limit: int = 8) -> list[str]:
+    """A model's list of points as a list of non-empty strings (a lone string becomes one)."""
+    items = value if isinstance(value, list) else [value]
+    points = [item if isinstance(item, str) else json.dumps(item) for item in items if item]
+    return [point.strip() for point in points if point.strip()][:limit]
+
 
 # --- planner ---
 PLANNER_SYS = """You are a quantitative research lead. Turn a trading idea into a
@@ -41,8 +55,9 @@ def validate_spec(spec: dict, max_params: int = 4) -> dict:
     """Coerce a model-written spec into something the harness can run.
 
     Non-numeric values are dropped, whole-number floats become ints (so a window
-    of 60.0 works with rolling()), and every parameter name must be a valid
-    Python identifier because it is passed to positions() as a keyword.
+    of 60.0 works with rolling()), every parameter name must be a valid Python
+    identifier because it is passed to positions() as a keyword, and the grid
+    must hold at least two configurations: one alone can't be tested for luck.
     """
     if not isinstance(spec, dict):
         raise SpecError("spec is not a JSON object")
@@ -61,14 +76,16 @@ def validate_spec(spec: dict, max_params: int = 4) -> dict:
         clean[name] = sorted({int(v) if float(v).is_integer() else float(v) for v in numbers})
     if len(clean) > max_params:
         raise SpecError(f"{len(clean)} parameters; use at most {max_params}")
+    if math.prod(len(values) for values in clean.values()) < 2:
+        raise SpecError("the grid has only one configuration; give a parameter several values")
 
     queries = spec.get("search_queries") or []
     return {
         **spec,
         "param_grid": clean,
         "search_queries": [q for q in queries if isinstance(q, str)][:3],
-        "name": spec.get("name", "Strategy"),
-        "hypothesis": spec.get("hypothesis", ""),
+        "name": str(spec.get("name") or "Strategy"),
+        "hypothesis": str(spec.get("hypothesis") or ""),
     }
 
 
@@ -102,15 +119,17 @@ def positions(prices: pd.DataFrame, **params) -> pd.DataFrame
 - Return target weights with the same index and columns, values in [-1, 1].
 - Row t may only use prices up to and including row t. The harness lags your
   weights by one day and charges costs, so do NOT shift them yourself.
-- Only import numpy and pandas. No I/O, no randomness, no network.
-- Handle warm-up NaNs by returning 0 weight."""
+- It is also run on shorter histories, down to the first few days, to check
+  that no position uses the future. It must work on any length: return 0
+  weight wherever there is not enough data yet (including warm-up NaNs).
+- Only import numpy and pandas. No I/O, no randomness, no network."""
 
 
 def write_code(llm: LLM, spec: dict, error: str | None = None, previous: str | None = None) -> str:
     """Write the strategy, or repair `previous` given the `error` it produced.
 
-    `error` is either a crash or the time-travel test's description of a leak,
-    which names the parameters and dates involved.
+    `error` is either a crash or the time-travel test's description of the
+    problem, which names the parameters and dates involved.
     """
     user = f"Spec:\n{json.dumps(spec, indent=2)}\n\nParameters: {list(spec['param_grid'])}"
     if error:
@@ -141,6 +160,7 @@ LOOKAHEAD_PATTERNS = [
     (r"center\s*=\s*True", "centred rolling window uses future data"),
     (r"import\s+(os|sys|subprocess|requests|socket)", "forbidden import"),
 ]
+RISK_LEVELS = ("low", "medium", "high")
 
 AUDITOR_SYS = """You audit trading code for look-ahead bias and data leakage.
 Reply JSON only: {"risk": "low"|"medium"|"high", "issues": [str, ...]}.
@@ -148,7 +168,11 @@ Full-sample normalisation, future shifts, back-fills and centred windows are hig
 
 
 def audit(llm: LLM, code: str) -> dict:
-    """Static patterns plus a Nemotron Nano review. A pattern hit is at least medium risk."""
+    """Static patterns plus a Nemotron Nano review.
+
+    A pattern hit is at least medium risk, and so is a risk level the model
+    states in a form we can't read: an unreadable answer is not a clean bill.
+    """
     static = [message for pattern, message in LOOKAHEAD_PATTERNS if re.search(pattern, code)]
     review = llm.chat_json(
         "auditor",
@@ -158,12 +182,14 @@ def audit(llm: LLM, code: str) -> dict:
         mock=lambda: json.dumps({"risk": "high" if static else "low", "issues": static}),
         max_tokens=800,
     )
-    risk = review.get("risk", "low")
+    risk = str(review.get("risk", "")).strip().lower()
+    if risk not in RISK_LEVELS:
+        risk = "medium"
     if static and risk == "low":
         risk = "medium"
     return {
         "risk": risk,
-        "issues": sorted(set(static) | set(review.get("issues", []))),
+        "issues": sorted(set(static) | set(_strings(review.get("issues")))),
         "static_hits": static,
     }
 
@@ -174,16 +200,29 @@ CLERK_SYS = """You triage web search results about a trading idea. Reply JSON on
  "citations": [{"title": str, "url": str}] (max 3, only from the given results)}"""
 
 
-def triage_prior_art(llm: LLM, spec: dict, hits: list[dict]) -> dict:
-    """Is this effect already published? Summarise the Tavily hits with citations."""
-    if not any(hit.get("url") for hit in hits):
-        return {
-            "already_known": None,
-            "summary": "No live prior-art search was run.",
-            "citations": [],
-        }
-    user = f"Idea: {spec.get('hypothesis')}\n\nResults:\n{json.dumps(hits, indent=1)}"
-    return llm.chat_json("clerk", "nano", CLERK_SYS, user, mock=lambda: "{}", max_tokens=800)
+def triage_prior_art(llm: LLM, spec: dict, hits: list[dict], note: str | None = None) -> dict:
+    """Is this effect already published? Summarise the Tavily hits with citations.
+
+    Only citations whose URL was actually in the search results are kept.
+    """
+    found = [hit for hit in hits if hit.get("url")]
+    if not found:
+        return {"already_known": None, "summary": note or "Nothing was found.", "citations": []}
+    user = f"Idea: {spec.get('hypothesis')}\n\nResults:\n{json.dumps(found, indent=1)}"
+    reply = llm.chat_json("clerk", "nano", CLERK_SYS, user, mock=lambda: "{}", max_tokens=800)
+    titles = {hit["url"]: hit.get("title") or hit["url"] for hit in found}
+    cited = reply.get("citations") if isinstance(reply.get("citations"), list) else []
+    citations = [
+        {"title": titles[c["url"]], "url": c["url"]}  # the search's own title, not the model's
+        for c in cited
+        if isinstance(c, dict) and c.get("url") in titles
+    ]
+    known = reply.get("already_known")
+    return {
+        "already_known": known if isinstance(known, bool) else None,
+        "summary": str(reply.get("summary") or ""),
+        "citations": citations[:3],
+    }
 
 
 # --- judge ---
@@ -192,45 +231,92 @@ overfitting. The verdict has ALREADY been decided by the statistics and you may
 not change it. Explain it to a smart non-specialist. Key ideas you may use:
 luck_sharpe_annual is the best Sharpe that zero-edge versions of everything
 tried would typically reach (a bootstrap Reality Check over the whole court
-record, not just this trial); p_real is the probability the edge is real after
-that correction; distinct_bets_total is how many genuinely independent bets
-the configurations amount to (random matrix theory), which can be far fewer
-than the number of configurations; prob_oos_loss is how often the in-sample
-winner loses money out of sample; pbo is only about whether the exact
-parameters were overfit, and a high pbo with a low prob_oos_loss means the
-parameters don't matter but the strategy family works. time_travel reports the
-harness test that re-runs the strategy on truncated history: if it FAILED, the
-code read the future, the backtest is meaningless whatever its Sharpe, and that
-is the headline. Reply JSON only:
+record, not just this trial). p_value is the share of bootstrap resamples in
+which those zero-edge versions do at least as well as the pick: small means
+luck struggles to explain the result. It is NOT the probability that the
+strategy is real, so never describe it that way. distinct_bets_total is how
+many genuinely independent bets the configurations amount to (random matrix
+theory), which can be far fewer than the number of configurations;
+prob_oos_loss is how often the in-sample winner loses money out of sample; pbo
+is only about whether the exact parameters were overfit, and a high pbo with a
+low prob_oos_loss means the parameters don't matter but the strategy family
+works. years_of_live_trading_to_prove_it is how long a live record at the
+walk-forward Sharpe would need to run to show its Sharpe is above zero.
+time_travel reports the harness test that re-runs the strategy on truncated
+history: if it FAILED, the code read the future or could not be shown not to,
+the backtest is meaningless whatever its Sharpe, and that is the headline.
+Reply JSON only:
 {"headline": str, "reasoning": [str, str, str], "what_would_change_my_mind": [str, str]}
 Use only numbers that appear in the evidence. Be direct, no hype."""
 
+VERDICT_WORDS = {
+    CONVICTED: re.compile(r"\bconvict", re.I),
+    HUNG_JURY: re.compile(r"\bhung\b", re.I),
+    ACQUITTED: re.compile(r"\bacquit", re.I),
+}
+
 
 def judge(llm: LLM, verdict: str, evidence: dict) -> dict:
-    """Nemotron Ultra explains a verdict that the statistics have already decided."""
-    return llm.chat_json(
+    """Nemotron Ultra explains a verdict that the statistics have already decided.
+
+    The reply is normalised, and if its headline names a different verdict, or
+    it gives no reasoning, the court's own explanation is used instead.
+    """
+    fallback = court_opinion(verdict, evidence)
+    reply = llm.chat_json(
         "judge",
         "ultra",
         JUDGE_SYS,
         f"Verdict: {verdict}\nEvidence:\n{json.dumps(evidence, indent=2)}",
-        mock=lambda: json.dumps(demo_judgement(verdict, evidence)),
+        mock=lambda: json.dumps(fallback),
         max_tokens=1200,
     )
+    headline = str(reply.get("headline") or "").strip()
+    contradicts = any(
+        pattern.search(headline) for other, pattern in VERDICT_WORDS.items() if other != verdict
+    )
+    reasoning = _strings(reply.get("reasoning"), limit=5)
+    return {
+        "headline": fallback["headline"] if contradicts or not headline else headline,
+        "reasoning": reasoning or fallback["reasoning"],
+        "what_would_change_my_mind": _strings(reply.get("what_would_change_my_mind"), limit=4)
+        or fallback["what_would_change_my_mind"],
+    }
 
 
-def demo_judgement(verdict: str, e: dict) -> dict:
-    """The judge's explanation in demo mode, written from the same evidence the model sees."""
-    if e["time_travel"].startswith("FAILED"):
+def court_opinion(verdict: str, e: dict) -> dict:
+    """The court's own explanation, written from the same evidence the model sees.
+
+    Used in demo mode, and as the fallback when a live reply can't be used.
+    """
+    if e["time_travel_status"] != PASSED:
+        if e["time_travel_status"] == LEAKED:
+            what = "reads the future"
+            why = (
+                "A strategy can only trade on what it knew at the time. When positions on past "
+                "dates change as later data arrives, the backtest is using tomorrow's prices."
+            )
+        else:
+            what = "could not be shown not to read the future"
+            why = (
+                "The only way to check that a strategy never uses the future is to re-run it on "
+                "shorter history. This one could not be re-run that way, so the court cannot "
+                "rule it out."
+            )
+        repairs = e["repairs"]
+        if repairs:
+            unfixed = f"{repairs} repair{'s' if repairs > 1 else ''} did not fix it"
+        else:
+            unfixed = "It was not repaired"
         return {
-            "headline": f"{verdict}: this strategy reads the future. Its backtest Sharpe of "
+            "headline": f"{verdict}: this strategy {what}. Its backtest Sharpe of "
             f"{e['best_sharpe_annual']:.2f} is not evidence of anything.",
             "reasoning": [
                 e["time_travel_detail"],
-                "A strategy can only trade on what it knew at the time. When positions on past "
-                "dates change as later data arrives, the backtest is using tomorrow's prices.",
-                f"{e['repairs']} repair attempt(s) did not remove the leak, so the court does not "
-                "weigh the statistics, and the evidence room stays shut: a strategy that reads "
-                "the future would read the sealed evidence too.",
+                why,
+                f"{unfixed}, so the court does not weigh the statistics, and the evidence room "
+                "stays shut: a strategy that may read the future could read the sealed evidence "
+                "too.",
             ],
             "what_would_change_my_mind": [
                 "Rewriting every statistic as a rolling or expanding window over past data only",
@@ -242,15 +328,18 @@ def demo_judgement(verdict: str, e: dict) -> dict:
     if e["trial_number_on_this_data"] > 1:
         memory = (
             f" This is trial {e['trial_number_on_this_data']} on this data, and the court counts "
-            f"all {e['n_configs_total_on_this_data']} configurations tried so far (about "
-            f"{e['distinct_bets_total']:.0f} distinct bets)."
+            f"all {e['n_distinct_configs_on_this_data']} distinct configurations tried so far "
+            f"(about {e['distinct_bets_total']:.0f} distinct bets)."
         )
     years = e["years_of_live_trading_to_prove_it"]
-    proof = (
-        "No length of live track record would confirm it, because it does not beat luck."
-        if years is None
-        else f"Proving it live would take about {years} years."
-    )
+    if years is None:
+        proof = "Chosen walk-forward it loses money, so no live track record would confirm it."
+    elif years > 100:
+        proof = "At the Sharpe it earned walk-forward, proving it live would take over a century."
+    else:
+        proof = (
+            f"At the Sharpe it earned walk-forward, proving it live would take about {years} years."
+        )
     return {
         "headline": f"{verdict}: the best backtest Sharpe of {e['best_sharpe_annual']:.2f} "
         f"against {e['luck_sharpe_annual']:.2f} from luck alone.",
@@ -258,8 +347,8 @@ def demo_judgement(verdict: str, e: dict) -> dict:
             f"{e['n_configs']} configurations were tried here, but they amount to only about "
             f"{e['distinct_bets_this_trial']:.0f} genuinely different bets. Zero-edge versions of "
             f"them typically reach a best Sharpe of {e['luck_sharpe_annual']:.2f}.{memory}",
-            f"After that correction the probability the edge is real is "
-            f"{fmt_prob(e['p_real'])}. {proof}",
+            f"Luck alone does as well as the winner in {e['p_value']:.1%} of bootstrap "
+            f"resamples (the Reality Check's {fmt_p(e['p_value'])}). {proof}",
             f"The in-sample winner lost money out of sample in {e['prob_oos_loss']:.0%} of "
             f"train/test splits, and chosen walk-forward its Sharpe is "
             f"{e['walk_forward_sharpe']:.2f}. (Probability the exact parameters were overfit: "

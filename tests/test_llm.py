@@ -44,7 +44,7 @@ def test_retries_with_more_tokens_when_reasoning_eats_the_budget(live):
     reply = llm.chat("coder", "super", "sys", "u", mock=no_mock, max_tokens=1000)
     assert fake.requests[1]["max_tokens"] == 4000
     assert "def positions" in extract_code(reply)
-    assert len(llm.ledger) == 2 and "retry" in llm.ledger[1].note
+    assert len(llm.calls) == 2 and "retry" in llm.calls[1].note
     assert llm.total_cost() > 0
 
 
@@ -60,10 +60,26 @@ def test_a_model_that_never_answers_gives_a_clear_error(live):
         llm.chat("judge", "ultra", "sys", "u", mock=no_mock)
 
 
-def test_other_errors_are_not_swallowed(live):
+def test_other_errors_are_not_swallowed_and_failures_are_logged(live):
     llm, _ = live([bad_request("model not found")])
     with pytest.raises(openai.BadRequestError):
         llm.chat("judge", "ultra", "sys", "u", mock=no_mock)  # not JSON mode: no fallback
+    assert len(llm.calls) == 1 and llm.calls[0].note.startswith("failed: BadRequestError")
+
+
+def test_json_mode_is_not_blamed_for_a_request_that_fails_anyway(live):
+    """A 400 for another reason (say, a prompt that is too long) fails again without JSON mode."""
+    llm, fake = live(
+        [bad_request("prompt too long"), bad_request("prompt too long"), response('{"a": 1}')]
+    )
+    with pytest.raises(openai.BadRequestError, match="prompt too long"):
+        llm.chat_json("planner", "ultra", "sys", "u", mock=no_mock)
+    assert [call.note.split(":")[0] for call in llm.calls] == [
+        "failed",
+        "retry without JSON mode; failed",
+    ]
+    assert llm.chat_json("planner", "ultra", "sys", "u", mock=no_mock) == {"a": 1}
+    assert "response_format" in fake.requests[2]  # JSON mode is still used for this model
 
 
 def test_parsing_helpers():

@@ -4,10 +4,14 @@ Every configuration ever tried on a dataset is kept: its daily returns on the
 open evidence. The next trial on the same data is judged against all of them,
 so the Reality Check's bar for luck and the distinct-bet count both grow as
 genuinely new ideas are tried. Each opening of the sealed evidence is recorded
-too, because evidence that has been looked at is no longer sealed.
+too, before the test runs, because evidence that has been looked at is no
+longer sealed.
 
 Records are keyed by `record_key`: a fingerprint of the exact prices plus the
 sealed fraction, so different data, or a different seal, starts a new record.
+
+A court that silently forgets is worse than none, so a damaged record on disk
+raises LedgerError instead of quietly starting afresh.
 """
 
 from __future__ import annotations
@@ -19,6 +23,10 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+
+
+class LedgerError(RuntimeError):
+    """The court record on disk is damaged or incomplete."""
 
 
 def fingerprint(prices: pd.DataFrame) -> str:
@@ -42,7 +50,8 @@ class Ledger:
     """The court record. In memory by default; pass a directory to keep it across sessions.
 
     On disk: index.json (what was tried, verdicts, seal openings) and one .npy
-    file of daily returns per trial.
+    file of daily returns per trial. Everything read from a Ledger is a copy,
+    so recording a new trial never changes what an earlier caller was given.
     """
 
     def __init__(self, directory: str | Path | None = None):
@@ -52,28 +61,35 @@ class Ledger:
         if self.dir and (self.dir / "index.json").exists():
             try:
                 self.index = json.loads((self.dir / "index.json").read_text())
-            except json.JSONDecodeError:
-                self.index = {}  # a corrupt index starts a fresh record
+            except (OSError, ValueError) as e:  # ValueError covers bad JSON and bad UTF-8
+                raise LedgerError(
+                    f"The court record {self.dir / 'index.json'} can't be read ({e}). Move it "
+                    "aside to start a new record: the court won't silently forget what was tried."
+                ) from e
 
     # --- reading ---
     def history(self, key: str) -> list[dict]:
         """Every trial on this data, oldest first."""
-        return self.index.get(key, {}).get("trials", [])
+        return list(self.index.get(key, {}).get("trials", []))
 
     def seals(self, key: str) -> list[dict]:
-        """Every time the sealed evidence for this data was opened."""
-        return self.index.get(key, {}).get("seals", [])
+        """Every opening of the sealed evidence for this data, including any still running."""
+        return list(self.index.get(key, {}).get("seals", []))
 
     def prior_returns(self, key: str) -> list[np.ndarray]:
         """The daily returns of every configuration tried before, one T x N array per trial."""
         if key not in self._returns:
-            arrays = []
-            for trial in self.history(key):
-                path = self.dir / trial["file"] if self.dir and trial.get("file") else None
-                if path and path.exists():
-                    arrays.append(np.load(path).astype(float))
-            self._returns[key] = arrays
-        return self._returns[key]
+            self._returns[key] = [self._load(trial) for trial in self.history(key)]
+        return list(self._returns[key])
+
+    def _load(self, trial: dict) -> np.ndarray:
+        path = self.dir / trial["file"] if self.dir and trial.get("file") else None
+        if path is None or not path.exists():
+            raise LedgerError(
+                f"The court record is missing the returns of the trial '{trial.get('idea')}' "
+                f"({path}). Restore the file, or clear this dataset's record to start again."
+            )
+        return np.load(path).astype(float)
 
     # --- writing ---
     def record(
@@ -95,14 +111,25 @@ class Ledger:
             item["file"] = f"{key}_{len(entry['trials']):04d}.npy"
             np.save(self.dir / item["file"], returns.astype(np.float32))
         entry["trials"].append(item)
-        self._returns.setdefault(key, []).append(returns)
+        self._returns[key].append(returns)
         self._save()
 
-    def record_seal(self, key: str, commitment: str, summary: dict) -> None:
-        """Note that the sealed evidence was opened, and for which commitment."""
+    def record_seal_opening(self, key: str, commitment: str, params: dict) -> None:
+        """Note that the sealed evidence is being opened for this commitment.
+
+        Called before the test runs, so the opening counts whatever happens next.
+        """
         self._entry(key)["seals"].append(
-            {"ts": round(time.time()), "commitment": commitment, **summary}
+            {"ts": round(time.time()), "commitment": commitment, "params": params, "result": None}
         )
+        self._save()
+
+    def record_seal_result(self, key: str, commitment: str, result: dict) -> None:
+        """Attach the outcome to the most recent opening for this commitment."""
+        for seal in reversed(self._entry(key)["seals"]):
+            if seal["commitment"] == commitment and seal["result"] is None:
+                seal["result"] = result
+                break
         self._save()
 
     def clear(self, key: str | None = None) -> None:
@@ -119,6 +146,9 @@ class Ledger:
         return self.index.setdefault(key, {"trials": [], "seals": []})
 
     def _save(self) -> None:
+        """Write the index atomically: a crash mid-write never leaves half a record."""
         if self.dir:
             self.dir.mkdir(parents=True, exist_ok=True)
-            (self.dir / "index.json").write_text(json.dumps(self.index))
+            partial = self.dir / "index.json.partial"
+            partial.write_text(json.dumps(self.index))
+            partial.replace(self.dir / "index.json")

@@ -7,8 +7,9 @@ On pure-noise markets this asks:
 
 - how often would the court's statistics alone acquit the leaky draft?
 - how often does the time-travel test catch it?
-- how often does the time-travel test wrongly flag an honest strategy
-  (every library family, and the repaired draft, on every market)?
+- how often does the time-travel test wrongly flag an honest strategy (every
+  configuration of every library family, and of the repaired draft, on every
+  market)?
 
     python -m examples.time_travel_experiment [n_markets]
 """
@@ -22,47 +23,35 @@ import numpy as np
 from overfit_court import _harness, stats
 from overfit_court.data import synthetic_prices
 from overfit_court.library import FAMILIES
-from overfit_court.pipeline import (
-    drop_flat,
-    expand_grid,
-    judge_statistics,
-    split_sealed,
-    time_travel_probes,
-)
+from overfit_court.pipeline import drop_flat, expand_grid, judge_statistics, split_sealed
 from overfit_court.sandbox import InProcessExecutor
-
-
-def positions_from(code: str):
-    namespace = {}
-    exec(code, namespace)  # built-in library code only
-    return namespace["positions"]
 
 
 def main(n_markets: int) -> None:
     anchor = FAMILIES["anchor"]
     grid = expand_grid(anchor.param_grid, 200)
-    probes = time_travel_probes(grid)
     # Every honest family, plus the repaired draft: none of them should ever be flagged.
     honest = [(f, f.code) for f in FAMILIES.values() if f.name != "anchor"]
     honest.append((anchor, anchor.fixed_code))
     verdicts, caught, best_sharpes, luck = Counter(), 0, [], []
-    false_alarms, honest_checks = 0, 0
+    false_alarms, honest_configs, honest_checks = 0, 0, 0
     start = time.perf_counter()
 
     for i in range(n_markets):
         open_prices, _ = split_sealed(synthetic_prices(seed=500 + i))
-        result = InProcessExecutor().run(anchor.code, open_prices, grid, 5.0, leak_check=probes)
-        judgement = judge_statistics(drop_flat(result.returns), result.grid, [], seed=i, n_boot=300)
-        verdicts[judgement.verdict] += 1
-        caught += result.leak["leaked"]
-        best_sharpes.append(stats.annualise(judgement.best_sharpe))
-        luck.append(judgement.reality_check.null_median_annual)
+        result = InProcessExecutor().run(anchor.code, open_prices, grid, 5.0)
+        findings = judge_statistics(drop_flat(result.returns), result.grid, seed=i, n_boot=300)
+        verdicts[findings.verdict] += 1
+        caught += result.time_travel["status"] == _harness.LEAKED
+        best_sharpes.append(stats.annualise(findings.best_sharpe))
+        luck.append(findings.reality_check.null_median_annual)
 
         for family, code in honest:
-            family_probes = time_travel_probes(expand_grid(family.param_grid, 500))
-            leak = _harness.time_travel(positions_from(code), open_prices, family_probes)
-            honest_checks += 1
-            false_alarms += leak["leaked"]
+            family_grid = expand_grid(family.param_grid, 500)
+            checked = InProcessExecutor().run(code, open_prices, family_grid, 5.0).time_travel
+            false_alarms += checked["status"] != _harness.PASSED
+            honest_configs += checked["configs"]
+            honest_checks += checked["checks"]
 
     print(
         f"Leaky 'long-run average' draft on {n_markets} pure-noise markets "
@@ -76,7 +65,10 @@ def main(n_markets: int) -> None:
     print(f"| Statistics alone: hung jury | {verdicts['HUNG JURY']} of {n_markets} |")
     print(f"| Statistics alone: convicted | {verdicts['CONVICTED']} of {n_markets} |")
     print(f"| Time-travel test caught it | {caught} of {n_markets} |")
-    print(f"| Honest strategies wrongly flagged | {false_alarms} of {honest_checks} |")
+    print(
+        f"| Honest strategies wrongly flagged | {false_alarms} of {len(honest) * n_markets} "
+        f"({honest_configs} configurations, {honest_checks} checks) |"
+    )
     print(f"\n{time.perf_counter() - start:.0f}s")
 
 

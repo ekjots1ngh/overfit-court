@@ -19,12 +19,14 @@ import time
 import pandas as pd
 
 from overfit_court.config import get_settings
-from overfit_court.data import synthetic_prices
+from overfit_court.data import PLANTED_SIGNAL, synthetic_prices
 from overfit_court.fishing import NemotronFisherman, ScriptedFisherman, run_expedition
 from overfit_court.llm import LLM
 from overfit_court.sandbox import InProcessExecutor
+from overfit_court.stats import P_VALUE_TO_ACQUIT
 
-MARKETS = [("pure noise", 0.0, 200), ("planted edge", 0.0008, 300)]  # (label, signal, first seed)
+# (label, planted signal, first market seed)
+MARKETS = [("pure noise", 0.0, 200), ("planted edge", PLANTED_SIGNAL, 300)]
 
 
 def silent(*_args):
@@ -64,17 +66,25 @@ def main(n_markets: int, use_nemotron: bool) -> None:
     print(
         "| Market | Expeditions | Median branches | Median distinct bets | Hit Sharpe >= 1 "
         "| Standard test says real | Final-grid check says real | Court acquits "
-        "| Sealed evidence confirms |"
+        "| Sealed evidence confirms | Court and sealed evidence both say real |"
     )
-    print("|---|---|---|---|---|---|---|---|---|")
+    print("|---|---|---|---|---|---|---|---|---|---|")
     for label, group in results.groupby("market", sort=False):
+        acquitted, confirmed = group.court_verdict == "ACQUITTED", group.sealed == "CONFIRMED"
         print(
             f"| {label} | {len(group)} | {group.configs.median():.0f} | "
             f"{group.distinct_bets.median():.0f} | {percent(group.hit_target)} | "
-            f"{percent(group.naive_p_real >= 0.95)} | {percent(group.final_grid_p_real >= 0.95)} | "
-            f"{percent(group.court_verdict == 'ACQUITTED')} | "
-            f"{percent(group.sealed == 'CONFIRMED')} |"
+            f"{percent(group.naive_p_value <= P_VALUE_TO_ACQUIT)} | "
+            f"{percent(group.final_grid_p_value <= P_VALUE_TO_ACQUIT)} | "
+            f"{percent(acquitted)} | {percent(confirmed)} | {percent(acquitted & confirmed)} |"
         )
+        lucky = group[acquitted]
+        if len(lucky) and label == "pure noise":
+            print(
+                f"\n  On noise the court acquitted {len(lucky)}, after at most "
+                f"{lucky.attempts.max()} attempts each; the sealed evidence confirmed "
+                f"{int((lucky.sealed == 'CONFIRMED').sum())} of them.\n"
+            )
     print(
         f"\n{len(results)} expeditions in {time.perf_counter() - start:.0f}s; "
         "one row per expedition in fishing_results.csv"

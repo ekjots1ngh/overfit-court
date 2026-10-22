@@ -14,12 +14,6 @@ A running log written while building. Each item says what happened, why it matte
 
 5. **Upload paths.** It was unclear from the docs whether uploading to a path whose parent directory doesn't exist creates the directory. I create `/workspace` in the setup step to be safe. *Suggestion:* state the behaviour in the `files=` docstring.
 
-6. **What went well:** the checkpoint-and-branch model is exactly right for experiment grids. Setup runs once, every branch is isolated, and each result reports its own compute time and cost, which made per-trial cost accounting straightforward. It also enabled something I haven't seen pitched before: using isolation as a scientific guarantee (the research checkpoint physically doesn't contain the held-out data).
+6. **Pinning the environment is up to you.** A sandbox built from `python:3.12-slim` with a bare `pip install numpy pandas` gets whatever versions are current that day, so the same job can give different numbers in a sandbox and on the machine that launched it. I now install the launching machine's exact versions and cache the image per version set. *Suggestion:* a documented pattern (or a helper) for building an image from a requirements file and reusing it by content hash.
 
-## Token Factory inference and Nemotron
-
-<!-- Add during live testing: model ID discovery, JSON mode reliability per tier, whether reasoning traces appear in content, latency by tier, rate limits. -->
-
-## Tavily
-
-<!-- Add during live testing. -->
+7. **What went well:** the checkpoint-and-branch model is exactly right for experiment grids. Setup runs once, every branch is isolated, and each result reports its own compute time and cost, which made per-trial cost accounting straightforward. It also enabled something I haven't seen pitched before: using isolation as a scientific guarantee (the research checkpoint physically doesn't contain the held-out data).

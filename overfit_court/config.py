@@ -34,8 +34,8 @@ class Settings:
     base_url: str  # Token Factory's OpenAI-compatible endpoint
     tavily_api_key: str | None
     models: dict = field(default_factory=dict)  # tier ("nano", "super", "ultra") -> model id
-    prices: dict = field(default_factory=dict)  # tier -> (USD per 1M input, per 1M output tokens)
-    executor: str = "local"  # "nebius" runs backtests in Token Factory Sandboxes
+    token_prices: dict = field(default_factory=dict)  # tier -> (USD per 1M input, 1M output)
+    executor: str = "local"  # "nebius" (Token Factory Sandboxes) or "local" (subprocesses)
     max_configs: int = 120  # largest parameter grid tried in one trial
     cost_bps: float = 5.0  # trading cost per unit of turnover, in basis points
 
@@ -54,6 +54,9 @@ class Settings:
 
 
 def get_settings() -> Settings:
+    # With a key, model-written code runs, so it belongs in Token Factory Sandboxes
+    # unless OC_EXECUTOR explicitly says otherwise.
+    default_executor = "nebius" if os.getenv("NEBIUS_API_KEY") else "local"
     return Settings(
         nebius_api_key=os.getenv("NEBIUS_API_KEY"),
         base_url=os.getenv("NEBIUS_BASE_URL", "https://api.tokenfactory.nebius.com/v1/"),
@@ -65,12 +68,12 @@ def get_settings() -> Settings:
             "ultra": os.getenv("MODEL_ULTRA", "nvidia/nemotron-3-ultra-550b-a55b"),
         },
         # Only used to report spend; check your Token Factory console for current prices.
-        prices={
+        token_prices={
             "nano": (_env_float("PRICE_NANO_IN", 0.06), _env_float("PRICE_NANO_OUT", 0.24)),
             "super": (_env_float("PRICE_SUPER_IN", 0.30), _env_float("PRICE_SUPER_OUT", 0.90)),
             "ultra": (_env_float("PRICE_ULTRA_IN", 1.00), _env_float("PRICE_ULTRA_OUT", 3.00)),
         },
-        executor=os.getenv("OC_EXECUTOR", "local"),
+        executor=os.getenv("OC_EXECUTOR") or default_executor,
         max_configs=_env_int("OC_MAX_CONFIGS", 120),
         cost_bps=_env_float("OC_COST_BPS", 5.0),
     )

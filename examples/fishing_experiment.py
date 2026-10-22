@@ -38,7 +38,8 @@ def percent(flags) -> str:
 
 
 def main(n_markets: int, use_nemotron: bool) -> None:
-    settings = get_settings()
+    # Offline unless Nemotron is fishing, so a developer's .env can't change the results.
+    settings = get_settings() if use_nemotron else get_settings().offline()
     executor = InProcessExecutor()
     rows = []
     start = time.perf_counter()
@@ -65,7 +66,7 @@ def main(n_markets: int, use_nemotron: bool) -> None:
     print(f"Fisherman: {rows[0]['fisherman']}\n")
     print(
         "| Market | Expeditions | Median branches | Median distinct bets | Hit Sharpe >= 1 "
-        "| Standard test says real | Final-grid check says real | Court acquits "
+        "| Standard test says real | Claim's-grid check says real | Court acquits "
         "| Sealed evidence confirms | Court and sealed evidence both say real |"
     )
     print("|---|---|---|---|---|---|---|---|---|---|")
@@ -75,7 +76,7 @@ def main(n_markets: int, use_nemotron: bool) -> None:
             f"| {label} | {len(group)} | {group.configs.median():.0f} | "
             f"{group.distinct_bets.median():.0f} | {percent(group.hit_target)} | "
             f"{percent(group.naive_p_value <= P_VALUE_TO_ACQUIT)} | "
-            f"{percent(group.final_grid_p_value <= P_VALUE_TO_ACQUIT)} | "
+            f"{percent(group.claim_grid_p_value <= P_VALUE_TO_ACQUIT)} | "
             f"{percent(acquitted)} | {percent(confirmed)} | {percent(acquitted & confirmed)} |"
         )
         lucky = group[acquitted]

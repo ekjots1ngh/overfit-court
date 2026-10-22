@@ -42,8 +42,8 @@ PERIODS_PER_YEAR = 252
 EULER_GAMMA = 0.5772156649015329
 FLAT = 1e-12  # a configuration whose returns vary less than this never trades
 
-# Verdicts on the open evidence...
-CONVICTED, HUNG_JURY, ACQUITTED = "CONVICTED", "HUNG JURY", "ACQUITTED"
+# Verdicts on the open evidence (a mistrial is a trial that failed before a verdict)...
+CONVICTED, HUNG_JURY, ACQUITTED, MISTRIAL = "CONVICTED", "HUNG JURY", "ACQUITTED", "MISTRIAL"
 # ...and on the sealed evidence.
 CONFIRMED, INCONCLUSIVE, REFUTED = "CONFIRMED", "INCONCLUSIVE", "REFUTED"
 

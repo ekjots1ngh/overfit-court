@@ -6,14 +6,17 @@ import numpy as np
 import pytest
 from fake_contree import FakeContree
 
+from overfit_court import _harness
 from overfit_court.data import synthetic_prices
 from overfit_court.library import FAMILIES
 from overfit_court.pipeline import expand_grid
 from overfit_court.sandbox import (
     REQUIREMENTS,
+    JobOutput,
     LocalExecutor,
     NebiusSandboxExecutor,
     get_executor,
+    merge,
 )
 
 MOMENTUM = FAMILIES["momentum"].code
@@ -59,12 +62,66 @@ def test_a_crashing_strategy_reports_every_configuration():
     assert result.time_travel["status"] == "unverified"  # nothing ran, so nothing passed
 
 
-def test_code_that_does_not_import_fails_before_any_branch():
+def test_code_that_is_not_python_fails_before_any_branch():
     prices = synthetic_prices(n_days=300, seed=2)
-    result = NebiusSandboxExecutor(client=FakeContree()).run("not python", prices, GRID, 5.0)
+    fake = FakeContree()
+    result = NebiusSandboxExecutor(client=fake).run("def positions(:\n", prices, GRID, 5.0)
     assert result.returns.shape[1] == 0
-    assert "failed to import" in next(iter(result.errors.values()))
+    assert "not valid Python" in next(iter(result.errors.values()))
     assert result.time_travel["status"] == "unverified"
+    assert len(fake.created) == 3  # base, dependencies, checkpoint: no branch ever ran
+
+
+def test_strategy_code_never_runs_where_the_data_file_is():
+    """Module-level code that copies the data file finds nothing: the checkpoint only parses
+    the code, and each branch deletes the file before loading the strategy."""
+    copies_the_data = (
+        "import shutil\n"
+        "shutil.copy('prices.csv', 'stash.csv')\n\n"
+        "def positions(prices, **params):\n"
+        "    return prices * 0\n"
+    )
+    prices = synthetic_prices(n_days=300, seed=2)
+    fake = FakeContree()
+    result = NebiusSandboxExecutor(n_chunks=2, client=fake).run(copies_the_data, prices, GRID, 5.0)
+    assert all("FileNotFoundError" in error for error in result.errors.values())
+    assert not any("/workspace/stash.csv" in image.files for image in fake.created)
+
+
+def test_the_evidence_room_shares_its_checks_across_branches():
+    """One configuration, hundreds of cuts: each branch checks every n-th cut."""
+    prices = synthetic_prices(n_days=600, seed=1)
+    sealed_days = list(range(450, 600))
+    fake = FakeContree()
+    one = {"committed": {"lookback": 60, "skip": 5, "top_frac": 0.3}}
+    result = NebiusSandboxExecutor(n_chunks=4, client=fake).run(
+        MOMENTUM, prices, one, 5.0, extra_cuts=sealed_days
+    )
+    cuts = _harness.cut_points(600, sealed_days)
+    assert len(fake.created) == 3 + 4  # four branches for the one configuration
+    report = result.time_travel
+    assert report["status"] == "passed" and report["configs"] == 1
+    assert report["checks"] == report["expected_checks"] == len(cuts)
+    assert list(result.returns.columns) == ["committed"]
+
+
+def test_copies_of_one_configuration_must_agree():
+    prices = synthetic_prices(n_days=300, seed=1)
+    index = prices.index
+    agree = np.ones((300, 1))
+    report = _harness.finish(_harness.new_report())
+    outputs = [JobOutput(["c"], agree, {}, report), JobOutput(["c"], agree * 2, {}, report)]
+    merged = merge(outputs, {"c": {}}, index, time_travel=True)
+    assert merged.time_travel["status"] == "unverified"
+    assert "isn't deterministic" in merged.time_travel["error"]
+
+
+def test_a_runner_that_exits_without_results_is_the_codes_fault():
+    exits = "import os\n\ndef positions(prices, **params):\n    os._exit(0)\n"
+    prices = synthetic_prices(n_days=300, seed=2)
+    result = LocalExecutor(n_chunks=1).run(exits, prices, GRID, 5.0)
+    assert all("without writing its results" in e for e in result.errors.values())
+    assert result.time_travel["lost_configs"] == 0
 
 
 def test_executor_names_are_checked():

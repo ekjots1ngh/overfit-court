@@ -2,7 +2,9 @@
 
 import numpy as np
 import pytest
+from filelock import FileLock
 
+from overfit_court import ledger as ledger_module
 from overfit_court.data import PLANTED_SIGNAL, synthetic_prices
 from overfit_court.ledger import Ledger, LedgerError, fingerprint, record_key
 from overfit_court.pipeline import run_trial
@@ -79,6 +81,58 @@ def test_a_damaged_record_is_an_error_not_a_fresh_start(tmp_path, settings, sile
     with pytest.raises(LedgerError, match="can't be read"):
         Ledger(tmp_path)
     assert (tmp_path / "index.json").read_text() == '{"truncated": '  # left as it was
+
+
+def test_two_runs_on_one_record_never_overwrite_each_other(tmp_path):
+    first, second = Ledger(tmp_path), Ledger(tmp_path)  # both opened before either writes
+    first.record("k", "first idea", np.ones((10, 2)), "CONVICTED")
+    second.record("k", "second idea", np.ones((10, 3)), "CONVICTED")
+    reopened = Ledger(tmp_path)
+    assert [trial["idea"] for trial in reopened.history("k")] == ["first idea", "second idea"]
+    assert [array.shape[1] for array in reopened.prior_returns("k")] == [2, 3]
+
+
+def test_every_read_sees_what_other_runs_have_recorded(tmp_path):
+    """A trial running alongside a fishing expedition on the same data counts its branches."""
+    reader, writer = Ledger(tmp_path), Ledger(tmp_path)
+    assert reader.history("k") == [] and reader.prior_returns("k") == []
+    writer.record("k", "the expedition", np.ones((10, 40)), "CONVICTED")
+    assert writer.record_seal_opening("k", "first", {}) == 0
+    assert [trial["idea"] for trial in reader.history("k")] == ["the expedition"]
+    assert [array.shape[1] for array in reader.prior_returns("k")] == [40]
+    assert reader.record_seal_opening("k", "second", {}) == 1  # counted under the lock
+
+
+def test_a_held_lock_is_reported_not_ignored(tmp_path, monkeypatch):
+    monkeypatch.setattr(ledger_module, "LOCK_TIMEOUT_S", 0.2)
+    with FileLock(tmp_path / "index.lock"), pytest.raises(LedgerError, match="locked"):
+        Ledger(tmp_path).record("k", "idea", np.ones((10, 2)), "CONVICTED")
+
+
+def test_a_lock_file_left_by_a_killed_run_is_harmless(tmp_path):
+    (tmp_path / "index.lock").write_text("")  # the run died; its operating-system lock went
+    Ledger(tmp_path).record("k", "idea", np.ones((10, 2)), "CONVICTED")
+    assert len(Ledger(tmp_path).history("k")) == 1
+
+
+def test_a_cleared_record_never_serves_old_returns(tmp_path):
+    ledger = Ledger(tmp_path)
+    ledger.record("k", "old", np.ones((10, 2)), "CONVICTED")
+    ledger.prior_returns("k")  # read once, so it is cached
+    ledger.clear("k")
+    ledger.record("k", "new", np.zeros((10, 3)), "CONVICTED")
+    [returns] = ledger.prior_returns("k")
+    assert returns.shape == (10, 3) and not returns.any()
+
+
+def test_a_record_reopened_from_disk_gives_exactly_the_same_numbers(tmp_path):
+    returns = np.random.default_rng(0).normal(0, 0.01, (50, 3))
+    in_memory, on_disk = Ledger(), Ledger(tmp_path)
+    for ledger in (in_memory, on_disk):
+        ledger.record("k", "idea", returns, "CONVICTED")
+    [kept] = in_memory.prior_returns("k")
+    [reloaded] = Ledger(tmp_path).prior_returns("k")
+    assert np.array_equal(kept, reloaded)
 
 
 def test_clearing_forgets_the_data_and_its_files(tmp_path, settings, silent):

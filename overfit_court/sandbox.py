@@ -13,12 +13,19 @@ InProcessExecutor      Inside this Python process. Only for the trusted
                        spawning a process per run would dominate the runtime.
 
 A run is split into jobs, one per chunk of the parameter grid. Each job
-backtests its configurations and time-travel tests every one of them. In Token
-Factory Sandboxes every job is its own branch of a single checkpoint, so they
-all run in parallel from the same starting state:
+backtests its configurations and time-travel tests every one of them. The
+evidence room has one configuration but hundreds of cuts, so its cuts are
+shared out between the jobs instead. A job that produces no results fails the
+time-travel test, whatever the reason. In sandboxes, a branch lost to a
+network or API error is retried once, and if it is lost again its
+configurations are counted as lost: the trial then ends in a mistrial rather
+than blaming the code. A job that fails because of the code (it isn't valid
+Python, crashes or runs out of time) is the code's problem and goes back to
+the engineer. In Token Factory Sandboxes every job is its own branch of a
+single checkpoint, so they all run in parallel from the same starting state:
 
     python:3.12-slim -> + numpy, pandas      (cached across trials)
-                        -> + data + strategy (one checkpoint per trial)
+                        -> + data + strategy (one checkpoint per trial; nothing runs yet)
                            -> one branch per job
 """
 
@@ -42,11 +49,20 @@ import pandas as pd
 from contree_sdk import Contree
 from contree_sdk.auth import IAMAuth
 from contree_sdk.config import ContreeConfig
+from contree_sdk.sdk.exceptions import OperationTimedOutError
 
 from . import _harness
 
 RUNNER = Path(_harness.__file__).read_text()  # uploaded verbatim as runner.py
 WORKDIR = "/workspace"
+# Check the strategy is valid Python without running any of it.
+CHECK_SYNTAX = "python -c \"import ast; ast.parse(open('strategy.py').read())\""
+# Run one job. A runner that exits cleanly without writing its results (code
+# that calls os._exit, say) has failed, and says so.
+RUN_JOB = (
+    "python runner.py && { test -f result.npz || "
+    "{ echo 'the runner exited without writing its results' >&2; exit 1; }; }"
+)
 # The sandbox gets exactly the numpy and pandas versions this machine has, so a
 # sandbox run and a local run of the same job give the same numbers.
 REQUIREMENTS = f"numpy=={np.__version__} pandas=={pd.__version__}"
@@ -80,16 +96,24 @@ class ExecutionResult:
         }
 
 
-def make_jobs(grid: dict, n_chunks: int, cost_bps: float, time_travel: bool) -> list[dict]:
-    """Split the grid into at most `n_chunks` jobs."""
+def make_jobs(grid: dict, n_chunks: int, cost_bps: float, time_travel: bool, cuts) -> list[dict]:
+    """Split a run into at most `n_chunks` jobs.
+
+    Each job usually takes every n-th configuration of the grid and checks it
+    at every cut (history length, in days). A grid of one configuration, the
+    evidence room's, is split by cut instead: each job checks it at every n-th
+    cut, so its hundreds of checks run in parallel. Either way every
+    configuration is checked at every cut exactly once.
+    """
     if not grid:
         raise ValueError("The parameter grid is empty: there is nothing to run.")
+    cuts = sorted(int(k) for k in cuts)
+    job = {"cost_bps": cost_bps, "time_travel": time_travel}
+    if len(grid) == 1 and time_travel and len(cuts) > n_chunks:
+        return [{**job, "grid": dict(grid), "cuts": cuts[i::n_chunks]} for i in range(n_chunks)]
     keys = list(grid)
     n = min(n_chunks, len(keys))
-    return [
-        {"grid": {k: grid[k] for k in keys[i::n]}, "cost_bps": cost_bps, "time_travel": time_travel}
-        for i in range(n)
-    ]
+    return [{**job, "grid": {k: grid[k] for k in keys[i::n]}, "cuts": cuts} for i in range(n)]
 
 
 def decode(blob: bytes) -> JobOutput:
@@ -99,30 +123,49 @@ def decode(blob: bytes) -> JobOutput:
         return JobOutput(meta["keys"], z["R"], meta["errors"], meta["time_travel"])
 
 
-def failed(job: dict, error: str) -> JobOutput:
-    """A job that could not run at all: every configuration in it gets the error.
+def failed(job: dict, error: str, *, lost: bool = False) -> JobOutput:
+    """A job that produced no results: every configuration in it gets the error.
 
-    It has no time-travel report. Its configurations produce no returns, so they
-    are never judged; if no job survives, the merged report has nothing in it and
-    stays "unverified".
+    `lost` means the sandbox service lost it; otherwise the strategy failed.
+    Either way none of its configurations was verified, so the run can't pass
+    the time-travel test.
     """
-    return JobOutput([], np.zeros((0, 0)), dict.fromkeys(job["grid"], error), None)
+    n = len(job["grid"])
+    if lost:
+        error = f"the results of {n} configurations were lost ({error})"
+    report = None
+    if job.get("time_travel"):
+        report = _harness.unverified_report(error, lost_configs=n if lost else 0)
+    return JobOutput([], np.zeros((0, 0)), dict.fromkeys(job["grid"], error), report)
 
 
 def merge(
     outputs: list[JobOutput], grid: dict, index: pd.Index, time_travel: bool
 ) -> ExecutionResult:
-    """Combine job outputs into one result, with columns in grid order."""
-    columns, errors = {}, {}
+    """Combine job outputs into one result, with columns in grid order.
+
+    When jobs share a configuration (the evidence room's), every job's returns
+    for it must agree, and if it failed in any job it failed.
+    """
+    columns, errors, disagree = {}, {}, []
     for out in outputs:
         errors.update(out.errors)
         for j, key in enumerate(out.keys):
-            columns[key] = out.returns[:, j]
-    ordered = [k for k in grid if k in columns]
+            column = out.returns[:, j]
+            earlier = columns.setdefault(key, column)  # the first job's copy, if there was one
+            if not np.allclose(earlier, column, rtol=0, atol=_harness.TOLERANCE):
+                disagree.append(key)
+    ordered = [k for k in grid if k in columns and k not in errors]
     returns = pd.DataFrame({k: columns[k] for k in ordered}, index=index)
     report = None
     if time_travel:
         report = _harness.merge_reports([out.time_travel for out in outputs if out.time_travel])
+        if disagree and report["error"] is None:
+            report["error"] = (
+                f"configuration {disagree[0]} gave different returns in different runs, so it "
+                "isn't deterministic"
+            )
+            _harness.finish(report)
     return ExecutionResult(returns, errors, grid, time_travel=report)
 
 
@@ -151,22 +194,25 @@ class NebiusSandboxExecutor:
         self.timeout_s = timeout_s
         self._client = client  # injectable for tests
 
-    def run(self, code, prices, grid, cost_bps, time_travel: bool = True) -> ExecutionResult:
-        return asyncio.run(self._run(code, prices, grid, cost_bps, time_travel))
+    def run(
+        self, code, prices, grid, cost_bps, time_travel: bool = True, extra_cuts=()
+    ) -> ExecutionResult:
+        cuts = _harness.cut_points(len(prices), extra_cuts)
+        jobs = make_jobs(grid, self.n_chunks, cost_bps, time_travel, cuts)
+        return asyncio.run(self._run(code, prices, grid, jobs, time_travel))
 
-    async def _run(self, code, prices, grid, cost_bps, time_travel) -> ExecutionResult:
+    async def _run(self, code, prices, grid, jobs, time_travel) -> ExecutionResult:
         client = self._client or self._make_client()
         setup: list[dict] = []
         deps = await self._dependencies_image(client, setup)
         checkpoint = await self._trial_checkpoint(deps, code, prices.to_csv(), setup)
         if checkpoint.exit_code != 0:
-            error = f"strategy failed to import: {_tail(checkpoint.stderr)}"
-            result = merge([failed({"grid": grid}, error)], grid, prices.index, time_travel)
+            error = f"the strategy is not valid Python: {_tail(checkpoint.stderr)}"
+            result = merge([failed(job, error) for job in jobs], grid, prices.index, time_travel)
             result.setup = setup
             return result
 
         # At most n_chunks branches, well inside the service's concurrency limit.
-        jobs = make_jobs(grid, self.n_chunks, cost_bps, time_travel)
         done = await asyncio.gather(*(self._branch(checkpoint, job) for job in jobs))
         result = merge([out for out, _ in done], grid, prices.index, time_travel)
         result.metrics = [metric for _, metric in done]
@@ -214,10 +260,14 @@ class NebiusSandboxExecutor:
         return deps
 
     async def _trial_checkpoint(self, deps, code: str, prices_csv: str, setup: list):
-        """Upload the harness, the strategy and the data once; every job branches from here."""
+        """Upload the harness, the strategy and the data once; every job branches from here.
+
+        The strategy is only parsed here, never run: no strategy code runs where
+        the data file is. In each branch the runner deletes the file first.
+        """
         t0 = time.perf_counter()
         checkpoint = await deps.run(
-            shell=f"cd {WORKDIR} && python -c 'import numpy, pandas, strategy'",
+            shell=f"cd {WORKDIR} && {CHECK_SYNTAX}",
             files={
                 f"{WORKDIR}/runner.py": RUNNER.encode(),
                 f"{WORKDIR}/strategy.py": code.encode(),
@@ -229,28 +279,44 @@ class NebiusSandboxExecutor:
         setup.append({"step": "trial checkpoint", "wall_s": round(time.perf_counter() - t0, 2)})
         return checkpoint
 
-    async def _branch(self, checkpoint, job: dict) -> tuple[JobOutput, dict]:
-        """Run one job in its own branch and read its result file back."""
-        t0 = time.perf_counter()
-        metric = {"configs": len(job["grid"])}
-        try:
-            out = await checkpoint.run(
-                shell=f"cd {WORKDIR} && python runner.py",
-                files={f"{WORKDIR}/job.json": json.dumps(job).encode()},
-                disposable=False,  # keep the image so result.npz can be read back
-                timeout=self.timeout_s,
-            )
-            metric.update(
-                wall_s=round(time.perf_counter() - t0, 3),
-                elapsed_s=out.result.elapsed_time.total_seconds(),
-                cost_usd=float(out.result.cost or 0.0),
-            )
-            if out.exit_code != 0:
-                return failed(job, _tail(out.stderr)), metric
-            return decode(await out.read(f"{WORKDIR}/result.npz")), metric
-        except Exception as e:  # a network or API failure loses this branch only
-            metric.update(wall_s=round(time.perf_counter() - t0, 3), error=str(e)[:300])
-            return failed(job, f"{type(e).__name__}: {e}"), metric
+    async def _branch(self, checkpoint, job: dict, tries: int = 2) -> tuple[JobOutput, dict]:
+        """Run one job in its own branch and read its result file back.
+
+        A network or API failure is retried once from the same checkpoint. A
+        failure of the code itself is not, because it would fail again: a
+        non-zero exit, or running past the time limit.
+        """
+        metric = {"configs": len(job["grid"]), "tries": 0}
+        too_slow = f"timed out after {self.timeout_s}s"
+        lost = "never ran"
+        started = time.perf_counter()
+        for attempt in range(1, tries + 1):
+            metric["tries"] = attempt
+            try:
+                out = await checkpoint.run(
+                    shell=f"cd {WORKDIR} && {RUN_JOB}",
+                    files={f"{WORKDIR}/job.json": json.dumps(job).encode()},
+                    disposable=False,  # keep the image so result.npz can be read back
+                    timeout=self.timeout_s,
+                )
+                elapsed = out.result.elapsed_time.total_seconds()
+                metric.update(
+                    wall_s=round(time.perf_counter() - started, 3),
+                    elapsed_s=elapsed,
+                    cost_usd=float(out.result.cost or 0.0),
+                )
+                if out.exit_code != 0:
+                    timed_out = elapsed >= 0.99 * self.timeout_s  # killed at the time limit
+                    return failed(job, too_slow if timed_out else _tail(out.stderr)), metric
+                return decode(await out.read(f"{WORKDIR}/result.npz")), metric
+            except OperationTimedOutError:  # the code ran too long: retrying won't help
+                metric["wall_s"] = round(time.perf_counter() - started, 3)
+                return failed(job, too_slow), metric
+            except Exception as e:  # the branch was lost, not the code's fault
+                lost = f"{type(e).__name__}: {e}"
+                metric["wall_s"] = round(time.perf_counter() - started, 3)
+                metric.setdefault("lost_tries", []).append(lost[:300])
+        return failed(job, lost, lost=True), metric
 
 
 # --- local subprocesses ---
@@ -259,13 +325,16 @@ class LocalExecutor:
 
     name = "local-subprocess"
 
-    def __init__(self, n_chunks: int = 4, timeout_s: int = 300):
+    def __init__(self, n_chunks: int = 4, timeout_s: int = 900):
         self.n_chunks = n_chunks
         self.timeout_s = timeout_s
 
-    def run(self, code, prices, grid, cost_bps, time_travel: bool = True) -> ExecutionResult:
+    def run(
+        self, code, prices, grid, cost_bps, time_travel: bool = True, extra_cuts=()
+    ) -> ExecutionResult:
         prices_csv = prices.to_csv()
-        jobs = make_jobs(grid, self.n_chunks, cost_bps, time_travel)
+        cuts = _harness.cut_points(len(prices), extra_cuts)
+        jobs = make_jobs(grid, self.n_chunks, cost_bps, time_travel, cuts)
         with ThreadPoolExecutor(len(jobs)) as pool:
             done = list(pool.map(lambda job: self._run_job(code, prices_csv, job), jobs))
         result = merge([out for out, _ in done], grid, prices.index, time_travel)
@@ -290,8 +359,10 @@ class LocalExecutor:
                     check=False,
                 )
                 error = None
-                if proc.returncode != 0 or not (work / "result.npz").exists():
+                if proc.returncode != 0:
                     error = _tail(proc.stderr)
+                elif not (work / "result.npz").exists():
+                    error = "the runner exited without writing its results"
             except subprocess.TimeoutExpired:
                 error = f"timed out after {self.timeout_s}s"
             wall = round(time.perf_counter() - t0, 3)
@@ -307,19 +378,22 @@ class InProcessExecutor:
 
     name = "in-process (trusted code only)"
 
-    def run(self, code, prices, grid, cost_bps, time_travel: bool = True) -> ExecutionResult:
+    def run(
+        self, code, prices, grid, cost_bps, time_travel: bool = True, extra_cuts=()
+    ) -> ExecutionResult:
         t0 = time.perf_counter()
-        namespace: dict = {}
-        exec(compile(code, "strategy.py", "exec"), namespace)  # trusted library code only
-        positions = namespace["positions"]
-        output = JobOutput(*_harness.evaluate(positions, prices, grid, cost_bps, time_travel))
+        load_strategy = _harness.strategy_loader(code)  # trusted library code only
+        cuts = _harness.cut_points(len(prices), extra_cuts)
+        output = JobOutput(
+            *_harness.evaluate(load_strategy, prices, grid, cost_bps, time_travel, cuts)
+        )
         result = merge([output], grid, prices.index, time_travel)
         wall = round(time.perf_counter() - t0, 3)
         result.metrics = [{"configs": len(grid), "wall_s": wall, "elapsed_s": wall}]
         return result
 
 
-EXECUTORS = {"nebius": NebiusSandboxExecutor, "local": LocalExecutor}
+EXECUTORS = {"nebius": NebiusSandboxExecutor, "local": LocalExecutor}  # see config.EXECUTOR_NAMES
 
 
 def get_executor(name: str):

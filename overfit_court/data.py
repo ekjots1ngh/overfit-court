@@ -57,7 +57,7 @@ def synthetic_prices(
 
     # Subtracting half the variance makes simple returns, which are what the harness
     # trades, average exactly zero: E[exp(shock - vol^2 / 2)] = 1. Without it,
-    # "pure noise" would drift upwards by about 2.5% a year.
+    # "pure noise" would drift upwards by about 2% a year.
     log_returns = drift + shocks - 0.5 * vols[state][:, None] ** 2
     dates = pd.bdate_range("2014-01-01", periods=n_days)
     names = [f"ASSET_{i:02d}" for i in range(n_assets)]

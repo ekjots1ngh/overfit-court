@@ -8,7 +8,7 @@ and runs them as new branches. The fisherman stops the moment it hits the
 target, exactly as a real p-hacker would. Its claim is then judged four ways:
 
 1. a standard backtest significance test of the claimed strategy alone;
-2. an honest-looking check of only the final grid it reports;
+2. an honest-looking check of only the attempt the claim came from;
 3. Overfit Court, counting every branch the fisherman walked;
 4. the sealed evidence, which no branch ever had access to.
 """
@@ -157,26 +157,45 @@ class NemotronFisherman:
             target=target, left=attempts_left or "several", catalogue=self.catalogue
         )
         user = "Previous attempts:\n" + ("\n".join(past) if past else "none yet")
-        reply = self.llm.chat_json(
-            "fisherman", "super", system, user, mock=lambda: "{}", max_tokens=1500
-        )
+        try:
+            reply = self.llm.chat_json(
+                "fisherman", "super", system, user, mock=lambda: "{}", max_tokens=1500
+            )
+        except Exception:  # no usable reply: the scripted fisherman takes this turn
+            reply = {}
         family = reply.get("family")
         proposed = reply.get("params") if isinstance(reply.get("params"), list) else []
         allowed = []
-        if family in FISHABLE:
+        if isinstance(family, str) and family in FISHABLE:
             grid = fishing_grid(family)
             for params in proposed[: self.max_branches]:
-                if (
-                    isinstance(params, dict)
-                    and set(params) == set(grid)
-                    and all(params[p] in grid[p] for p in grid)
-                    and _identity(family, params) not in tried
-                ):
-                    allowed.append({p: params[p] for p in grid})
+                branch = _from_catalogue(params, grid)
+                if branch is not None and _identity(family, branch) not in tried:
+                    allowed.append(branch)
         if not allowed:
             family, branches, idea = self.scripted.propose(history, tried, target, attempts_left)
             return family, branches, FALLBACK + idea
         return family, allowed, str(reply.get("idea", ""))[:160]
+
+
+def _from_catalogue(params, grid: dict) -> dict | None:
+    """A proposed set of parameters, as the catalogue's own values, or None if any isn't allowed.
+
+    A model may write 20.0 for 20 or true for 1; the strategy needs the
+    catalogue's own value (rolling(20.0) fails), and a boolean is never a number.
+    """
+    if not isinstance(params, dict) or set(params) != set(grid):
+        return None
+    branch = {}
+    for name, allowed in grid.items():
+        value = params[name]
+        if isinstance(value, bool) or not isinstance(value, int | float):
+            return None
+        match = [option for option in allowed if option == value]
+        if not match:
+            return None
+        branch[name] = match[0]
+    return branch
 
 
 # --- the expedition ---
@@ -203,7 +222,7 @@ class Expedition:
     claimed_params: dict
     claimed_sharpe_annual: float
     naive_p_value: float  # judge 1: a standard significance test of the claim alone
-    final_grid_p_value: float  # judge 2: a Reality Check over only the final attempt's grid
+    claim_grid_p_value: float  # judge 2: a Reality Check over only the claim's own attempt
     court: Findings  # judge 3: Overfit Court over every branch walked
     sealed: SealedResult | None  # judge 4: the sealed evidence
     n_configs: int
@@ -226,7 +245,7 @@ class Expedition:
             "claimed": f"{self.claimed_family} {self.claimed_params}",
             "claimed_sharpe_annual": round(self.claimed_sharpe_annual, 2),
             "naive_p_value": round(self.naive_p_value, 4),
-            "final_grid_p_value": round(self.final_grid_p_value, 4),
+            "claim_grid_p_value": round(self.claim_grid_p_value, 4),
             "court_verdict": self.court.verdict,
             "court_p_value": round(self.court.reality_check.p_value, 4),
             "luck_sharpe_annual": round(self.court.reality_check.null_median_annual, 2),
@@ -282,8 +301,8 @@ def run_expedition(
     attempts: list[Attempt] = []
     tried: set[str] = set()
     results: list[pd.DataFrame] = []  # one per attempt
-    params_of: dict[str, dict] = {}  # branch key -> parameters
-    family_of: dict[str, str] = {}  # branch key -> family
+    params_by_branch: dict[str, dict] = {}  # branch key -> parameters
+    family_by_branch: dict[str, str] = {}  # branch key -> family
     running_best = -np.inf
 
     for k in range(1, max_attempts + 1):
@@ -304,8 +323,8 @@ def run_expedition(
         best_annual = stats.annualise(float(sharpes.max()))
         running_best = max(running_best, best_annual)
         results.append(returns)
-        params_of.update(result.grid)
-        family_of.update(dict.fromkeys(returns.columns, family))
+        params_by_branch.update(result.grid)
+        family_by_branch.update(dict.fromkeys(returns.columns, family))
 
         luck = None
         if track_luck:
@@ -345,7 +364,7 @@ def run_expedition(
     sharpes = everything.apply(stats.sharpe)
     claim = str(sharpes.idxmax())
     claim_sharpe = float(sharpes.max())
-    family, params = family_of[claim], params_of[claim]
+    family, params = family_by_branch[claim], params_by_branch[claim]
     r = everything[claim].to_numpy()
 
     # Judge 1: the claimed strategy tested as if it were the only one ever tried.
@@ -353,13 +372,15 @@ def run_expedition(
         claim_sharpe, 0.0, len(r), float(st.skew(r)), float(st.kurtosis(r, fisher=False))
     )
     # Judge 2: a Reality Check over only the grid the claim came from (selective reporting).
-    final_grid = next(res for res in results if claim in res.columns)
+    claim_grid = next(res for res in results if claim in res.columns)
     reported = stats.reality_check(
-        final_grid.to_numpy(), claim_sharpe, n_boot=n_boot, seed=bootstrap_seed
+        claim_grid.to_numpy(), claim_sharpe, n_boot=n_boot, seed=bootstrap_seed
     )
     # Judge 3: Overfit Court, over every branch walked (and anything tried on this data before).
     log("Judging the claim against every branch walked...")
-    court = judge_statistics(everything, params_of, prior=prior, seed=bootstrap_seed, n_boot=n_boot)
+    court = judge_statistics(
+        everything, params_by_branch, prior=prior, seed=bootstrap_seed, n_boot=n_boot
+    )
     # Judge 4: one test on the sealed evidence.
     sealed = None
     if open_seal and cut is not None:
@@ -385,7 +406,7 @@ def run_expedition(
         claimed_params=params,
         claimed_sharpe_annual=stats.annualise(claim_sharpe),
         naive_p_value=naive,
-        final_grid_p_value=reported.p_value,
+        claim_grid_p_value=reported.p_value,
         court=court,
         sealed=sealed,
         n_configs=everything.shape[1],

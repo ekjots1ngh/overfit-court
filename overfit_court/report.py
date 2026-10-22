@@ -66,6 +66,10 @@ def _summary_rows(trial) -> list[tuple[str, str]]:
     ]
 
 
+# An opening counts even when it gives no valid result, so the record says so.
+OPENED_NO_RESULT = "Opened, with no valid result (the opening still counts)."
+
+
 def _sealed_rows(sealed) -> list[tuple[str, str]]:
     return [
         ("Commitment (SHA-256 of code, parameters, data, costs, harness)", sealed.commitment),
@@ -92,12 +96,16 @@ def court_record_markdown(trial) -> str:
     if trial.sealed:
         lines += ["", f"**Sealed evidence: {trial.sealed.verdict}**", "", "| | |", "|---|---|"]
         lines += [f"| {label} | {value} |" for label, value in _sealed_rows(trial.sealed)]
+    elif trial.failed_opening:
+        lines += ["", f"**Sealed evidence:** {OPENED_NO_RESULT} {trial.failed_opening}"]
     lines += ["", "**Reasoning**", *[f"- {r}" for r in trial.opinion.get("reasoning", [])]]
     lines += [
         "",
         "**What would change the verdict**",
         *[f"- {r}" for r in trial.opinion.get("what_would_change_my_mind", [])],
     ]
+    if trial.opinion.get("note"):
+        lines += ["", f"_{trial.opinion['note']}_"]
     if trial.prior_art.get("summary"):
         lines += ["", f"**Prior art:** {trial.prior_art['summary']}"]
     return "\n".join(lines)
@@ -142,7 +150,12 @@ def court_record_html(trial) -> str:
         )
     else:
         sealed = "<h2>Sealed evidence</h2><p>Still sealed: no strategy has been tested on it.</p>"
+        if trial.failed_opening:
+            why = html.escape(trial.failed_opening)
+            sealed = f"<h2>Sealed evidence</h2><p>{OPENED_NO_RESULT} {why}</p>"
     reasons = "".join(f"<li>{html.escape(r)}</li>" for r in trial.opinion.get("reasoning", []))
+    note = trial.opinion.get("note")  # set when the court's own opinion replaced the judge's
+    note = f"<p class='sub'>{html.escape(note)}</p>" if note else ""
     issued = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     return f"""<!doctype html>
 <html lang="en">
@@ -158,6 +171,7 @@ def court_record_html(trial) -> str:
 {_table(_summary_rows(trial))}
 <h2>Reasoning</h2>
 <ul>{reasons}</ul>
+{note}
 {sealed}
 <footer>Issued by Overfit Court on {issued}. Data fingerprint
 {html.escape(trial.record["dataset"])}, trial {e["trial_number_on_this_data"]} on this data.

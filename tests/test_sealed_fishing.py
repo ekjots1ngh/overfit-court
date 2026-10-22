@@ -1,5 +1,7 @@
 """The evidence room, and the fishing expedition."""
 
+import json
+
 import numpy as np
 import pytest
 
@@ -14,6 +16,7 @@ from overfit_court.pipeline import (
     split_sealed,
     unseal,
 )
+from overfit_court.report import court_record_markdown
 from overfit_court.sandbox import InProcessExecutor
 from overfit_court.stats import ACQUITTED, CONFIRMED
 
@@ -24,12 +27,12 @@ class SpyExecutor(InProcessExecutor):
     def __init__(self, ledger=None):
         self.seen, self.ledger = [], ledger
 
-    def run(self, code, prices, grid, cost_bps, time_travel=True):
+    def run(self, code, prices, grid, cost_bps, time_travel=True, extra_cuts=()):
         seals = None
         if self.ledger is not None:
             seals = sum(len(entry["seals"]) for entry in self.ledger.index.values())
         self.seen.append((prices.index.max(), len(grid), cost_bps, seals))
-        return super().run(code, prices, grid, cost_bps, time_travel)
+        return super().run(code, prices, grid, cost_bps, time_travel, extra_cuts)
 
 
 def test_research_never_sees_the_sealed_evidence(settings, silent):
@@ -98,6 +101,9 @@ def test_a_failed_opening_still_counts(settings, silent):
         unseal(trial, executor=InProcessExecutor(), log=silent)
     seals = trial.ledger.seals(trial.record["dataset"])
     assert len(seals) == 1 and seals[0]["result"] == {"verdict": "failed to run"}
+    assert "KeyError" in trial.failed_opening  # and the trial's own record says so
+    assert "Opened, with no valid result" in court_record_markdown(trial)
+    assert json.loads(trial.to_json())["sealed_evidence"]["valid_result"] is False
 
 
 def test_a_fishing_expedition_on_pure_noise(settings, silent):

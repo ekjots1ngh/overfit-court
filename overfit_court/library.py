@@ -310,6 +310,14 @@ def route(idea: str) -> Family:
     return FAMILIES[DEFAULT]
 
 
+def family_of(spec: dict) -> Family:
+    """The family a spec names, or the default one: demo mode needs code for every spec."""
+    name = spec.get("family")
+    if isinstance(name, str) and name in FAMILIES:
+        return FAMILIES[name]
+    return FAMILIES[DEFAULT]
+
+
 def spec_for(family: Family) -> dict:
     """The planner's spec for a family, in the same shape Nemotron Ultra returns."""
     return {

@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import difflib
 import html
+import re
 
 import altair as alt
 import numpy as np
@@ -31,7 +32,7 @@ from overfit_court.fishing import NemotronFisherman, ScriptedFisherman, run_expe
 from overfit_court.ledger import Ledger, record_key
 from overfit_court.llm import LLM
 from overfit_court.pipeline import SEALED_FRACTION, run_trial, unseal
-from overfit_court.report import court_record_html
+from overfit_court.report import OPENED_NO_RESULT, court_record_html
 from overfit_court.sandbox import InProcessExecutor, LocalExecutor, NebiusSandboxExecutor
 from overfit_court.stats import (
     ACQUITTED,
@@ -80,13 +81,13 @@ HOW_IT_WORKS = """
 a parameter grid, Nemotron 3 Super writes the strategy, Nemotron 3 Nano audits it. The harness
 applies the one-day lag and trading costs itself, so generated code cannot trade on today's close.
 
-**2. The time-travel test.** Every configuration is also re-run on history cut short at eight
-points, from the first 1% of the days to the first 80%, and every past position must stay exactly
-the same. If a position on a past date moves when later data is added, the code read the future.
-That catches what code review and statistics both miss: means or standard deviations over the
-whole series, negative shifts, back-fills, centred windows. A leak goes back to Nemotron Super with
-the exact dates, for repair. The test fails closed: code that crashes on shorter history can't be
-verified, and is treated like a leak.
+**2. The time-travel test.** Every configuration is also re-run on history cut short at up to
+fourteen points, from the first two days to the first 95%, and every past position must stay
+exactly the same. If a position on a past date moves when later data is added, the code read the
+future. That catches what code review and statistics both miss: means or standard deviations over
+the whole series, negative shifts, back-fills, centred windows. A leak goes back to Nemotron Super
+with the exact dates, for repair. The test fails closed: code that crashes on shorter history, or
+answers differently when run twice on the same data, can't be verified, and is treated like a leak.
 
 **3. Research happens in sandboxes that cannot see the future.** Only the open 75% of the data is
 uploaded to Token Factory Sandboxes. Every chunk of the grid is its own branch of one checkpoint.
@@ -109,6 +110,12 @@ the ruling and cannot change it.
 **7. The evidence room.** Commit to one strategy and it gets one test on the sealed 25%, in a fresh
 run. The commitment, a SHA-256 hash of the code, parameters, data, trading cost and harness, is
 recorded before the seal is opened. Every opening is counted, and repeat openings are corrected for.
+The time-travel test runs again there with a cut at every sealed day, so even code that cheats
+for a few days, once it can see sealed dates, is caught.
+
+**What it can't do.** A model may have memorised what real markets did before its training
+cutoff, so on real data the sealed test is only truly blind for dates after that. And the app's
+court record lasts for your session; the command line keeps a permanent one.
 """
 
 
@@ -136,12 +143,27 @@ def bullets(items) -> None:
     st.markdown(f"<ul>{points}</ul>", unsafe_allow_html=True)
 
 
+def plain(text) -> str:
+    """Text made safe for Streamlit's Markdown, so it shows exactly as written.
+
+    Progress lines and error messages can quote model output, which must never
+    turn into links, images, formatting, maths ($...$) or emoji (:name:). Every
+    character Markdown or Streamlit treats specially is escaped.
+    """
+    return re.sub(r"([\\`*_{}\[\]()#+\-.!|<>~$:])", r"\\\1", str(text))
+
+
+def say(line) -> None:
+    """A progress line, written plainly."""
+    st.write(plain(line))
+
+
 def run_safely(what: str, action):
     """Run `action`; if it fails, show what went wrong instead of a stack trace."""
     try:
         return action()
     except Exception as e:
-        st.error(f"{what} failed. {type(e).__name__}: {e}")
+        st.error(plain(f"{what} failed. {type(e).__name__}: {e}"))
         return None
 
 
@@ -176,9 +198,9 @@ def four_judges(expedition) -> None:
     )
     judge_card(
         columns[1],
-        "Check of the final grid only",
-        expedition.final_grid_p_value <= P_VALUE_TO_ACQUIT,
-        fmt_p(expedition.final_grid_p_value),
+        "Check of the claim's own grid",
+        expedition.claim_grid_p_value <= P_VALUE_TO_ACQUIT,
+        fmt_p(expedition.claim_grid_p_value),
         "What selective reporting of the last attempt shows",
     )
     judge_card(
@@ -302,18 +324,18 @@ def time_travel_panel(trial) -> None:
         title = "Time travel" if trial.time_traveller else "Time travel: could not be verified"
         banner("bad", title, trial.evidence()["time_travel_detail"], "h3")
     elif trial.caught_and_repaired:
-        first = trial.code_history[0]
-        repairs = len(trial.code_history) - 1
-        paragraph("⏳ Caught on attempt 1:", first["problem"])
+        caught = trial.first_leak
+        repairs = trial.judged_attempt - caught["attempt"]
+        paragraph(f"⏳ Caught on attempt {caught['attempt']}:", caught["problem"])
         st.markdown(
             f"**Repaired by Nemotron 3 Super** in {repairs} "
             f"{'attempt' if repairs == 1 else 'attempts'}, then re-tested: no time travel."
         )
         with st.expander("What changed in the code"):
             diff = difflib.unified_diff(
-                first["code"].splitlines(True),
+                caught["code"].splitlines(True),
                 trial.code.splitlines(True),
-                "first draft",
+                f"attempt {caught['attempt']}",
                 "after repair",
                 n=2,
             )
@@ -323,7 +345,7 @@ def time_travel_panel(trial) -> None:
         st.markdown(
             f"**⏳ Time-travel test: passed.** All {report['configs']} configurations were re-run "
             f"on history cut short at {cuts} points, and every past position stayed exactly the "
-            "same, so the strategy never used future data."
+            "same: no sign of future data."
         )
 
 
@@ -457,25 +479,40 @@ def render_story(settings: Settings, ledger: Ledger, executor) -> None:
         act = story["time_travel"]
         alone, trial = act.statistics_alone, act.trial
         evidence = trial.evidence()
+        numbers = (
+            f"Backtest Sharpe {act.leaky_sharpe_annual:.2f} against "
+            f"{alone.reality_check.null_median_annual:.2f} from luck "
+            f"({fmt_p(alone.reality_check.p_value)})."
+        )
+        if trial.caught_and_repaired:
+            outcome = (
+                "Caught, sent back to Nemotron Super, repaired. The honest version has Sharpe "
+                f"{evidence['best_sharpe_annual']:.2f} against "
+                f"{evidence['luck_sharpe_annual']:.2f} from luck."
+            )
+        else:
+            outcome = f"Caught. {evidence['time_travel_detail']}"
         left, right = st.columns(2)
         with left:
-            banner(
-                "fooled",
-                f"Statistics alone: {alone.verdict}",
-                f"Fooled. Backtest Sharpe {act.leaky_sharpe_annual:.2f} against "
-                f"{alone.reality_check.null_median_annual:.2f} from luck "
-                f"({fmt_p(alone.reality_check.p_value)}). Every multiple-testing check passes, "
-                "on pure noise, because the code is cheating.",
-                "h3",
-            )
+            if alone.verdict == ACQUITTED:
+                banner(
+                    "fooled",
+                    f"Statistics alone: {alone.verdict}",
+                    f"Fooled. {numbers} Every multiple-testing check passes, on pure noise, "
+                    "because the code is cheating.",
+                    "h3",
+                )
+            else:
+                banner(
+                    TONE[alone.verdict],
+                    f"Statistics alone: {alone.verdict}",
+                    f"{numbers} With these settings the statistics happen not to acquit it, but "
+                    "they can't see that it reads the future.",
+                    "h3",
+                )
         with right:
             banner(
-                TONE[trial.verdict],
-                f"With the time-travel test: {trial.verdict}",
-                f"Caught, sent back to Nemotron Super, repaired. The honest version has Sharpe "
-                f"{evidence['best_sharpe_annual']:.2f} against "
-                f"{evidence['luck_sharpe_annual']:.2f} from luck.",
-                "h3",
+                TONE[trial.verdict], f"With the time-travel test: {trial.verdict}", outcome, "h3"
             )
         time_travel_panel(trial)
 
@@ -525,12 +562,12 @@ def render_trial(settings: Settings, ledger: Ledger, prices, executor) -> None:
         with st.status("Court in session...", expanded=True) as status:
             try:
                 st.session_state.trial = run_trial(
-                    idea, prices, settings=settings, ledger=ledger, executor=executor, log=st.write
+                    idea, prices, settings=settings, ledger=ledger, executor=executor, log=say
                 )
                 status.update(label="Verdict reached", state="complete")
             except Exception as e:  # show a mistrial instead of a stack trace
                 status.update(label="Mistrial", state="error")
-                st.error(f"{type(e).__name__}: {e}")
+                st.error(plain(f"{type(e).__name__}: {e}"))
 
     trial = st.session_state.get("trial")
     if not trial:
@@ -600,6 +637,8 @@ def render_trial(settings: Settings, ledger: Ledger, prices, executor) -> None:
     bullets(trial.opinion.get("reasoning", []))
     st.markdown("**What would change the verdict**")
     bullets(trial.opinion.get("what_would_change_my_mind", []))
+    if trial.opinion.get("note"):
+        st.caption(plain(trial.opinion["note"]))
 
     st.subheader("🔒 The evidence room")
     render_evidence_room(trial, ledger, executor)
@@ -655,8 +694,16 @@ def render_evidence_room(trial, ledger: Ledger, executor) -> None:
             f"The seal on this data has been opened {openings} time(s) already. "
             "The court will correct for that."
         )
+    if trial.failed_opening:
+        st.caption(plain(f"This trial's last opening: {OPENED_NO_RESULT} {trial.failed_opening}"))
     if not trial.passed_time_travel:
         st.caption("Shut: a strategy that may read the future could read the sealed evidence too.")
+        return
+    if trial.audit.get("escapes"):
+        st.caption(
+            "Shut: the code reaches outside the prices it is given, so the time-travel test "
+            "can't vouch for it."
+        )
         return
     if st.button("Commit and open the evidence room"):
         with st.spinner("Opening a fresh sandbox with the sealed evidence..."):
@@ -701,12 +748,12 @@ def render_fishing(settings: Settings, ledger: Ledger, prices, seed: int, use_sa
                     executor=executor,
                     track_luck=True,
                     seed=seed,
-                    log=st.write,
+                    log=say,
                 )
                 status.update(label="The fisherman is back", state="complete")
             except Exception as e:
                 status.update(label="The expedition failed", state="error")
-                st.error(f"{type(e).__name__}: {e}")
+                st.error(plain(f"{type(e).__name__}: {e}"))
 
     expedition = st.session_state.get("expedition")
     if not expedition:

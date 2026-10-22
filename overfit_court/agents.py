@@ -2,7 +2,7 @@
 
     Planner   Nemotron 3 Ultra   turns an idea into a testable spec and grid
     Engineer  Nemotron 3 Super   writes the strategy, and repairs it from errors
-    Auditor   Nemotron 3 Nano    reviews the final code for look-ahead bias
+    Auditor   Nemotron 3 Nano    reviews the code judged for look-ahead bias
     Clerk     Nemotron 3 Nano    triages Tavily prior-art search results
     Judge     Nemotron 3 Ultra   explains the statistical verdict in plain English
 
@@ -10,7 +10,9 @@ None of them decides anything that matters. The verdict comes from `stats`;
 look-ahead bias is caught by the harness's time-travel test; the judge may
 only explain. Every reply is checked and normalised before it is used, because
 a live model can return the wrong types, an unknown risk level, citations it
-was never given, or a headline that contradicts the verdict.
+was never given, or a headline that contradicts the verdict. And when the
+auditor, clerk or judge can't give a usable reply at all, the court carries on
+with its own answer rather than throwing away a trial whose backtests have run.
 
 Each call also supplies a `mock`: the reply used in demo mode, when no API key
 is set, built from the strategy library.
@@ -18,7 +20,9 @@ is set, built from the strategy library.
 
 from __future__ import annotations
 
+import ast
 import json
+import keyword
 import math
 import re
 
@@ -33,6 +37,18 @@ def _strings(value, limit: int = 8) -> list[str]:
     items = value if isinstance(value, list) else [value]
     points = [item if isinstance(item, str) else json.dumps(item) for item in items if item]
     return [point.strip() for point in points if point.strip()][:limit]
+
+
+def _advice(llm: LLM, role: str, tier: str, system: str, user: str, *, mock, max_tokens: int):
+    """(reply, None) from an advisory role, or (None, why) if no usable reply came back.
+
+    Advice is not evidence: the auditor, clerk and judge never decide a verdict,
+    so when their reply can't be had or read, the caller uses the court's own.
+    """
+    try:
+        return llm.chat_json(role, tier, system, user, mock=mock, max_tokens=max_tokens), None
+    except Exception as e:  # an unreadable or empty reply, or the API failing
+        return None, f"{type(e).__name__}: {e}"[:200]
 
 
 # --- planner ---
@@ -51,13 +67,31 @@ class SpecError(ValueError):
     """The planner's spec can't be turned into a runnable parameter grid."""
 
 
-def validate_spec(spec: dict, max_params: int = 4) -> dict:
+def _parameter_value(value) -> int | float | None:
+    """A grid value as a plain int or float, or None if it isn't a usable number.
+
+    Whole-number floats become ints, so a window of 60.0 works with rolling().
+    Booleans, infinities, NaN and integers too big for a float are not numbers here.
+    """
+    if not isinstance(value, int | float) or isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except OverflowError:  # an integer with hundreds of digits
+        return None
+    if not math.isfinite(number):
+        return None
+    return int(number) if number.is_integer() else number
+
+
+def validate_spec(spec: dict, max_params: int = 4, max_values: int = 50) -> dict:
     """Coerce a model-written spec into something the harness can run.
 
-    Non-numeric values are dropped, whole-number floats become ints (so a window
-    of 60.0 works with rolling()), every parameter name must be a valid Python
-    identifier because it is passed to positions() as a keyword, and the grid
-    must hold at least two configurations: one alone can't be tested for luck.
+    Values that aren't usable numbers are dropped (see _parameter_value). Every
+    parameter name is passed to positions() as a keyword, so it must be a valid
+    Python identifier, not a keyword, and not "prices", which positions()
+    already takes. The grid must hold at least two configurations, because one
+    alone can't be tested for luck, and each parameter at most `max_values`.
     """
     if not isinstance(spec, dict):
         raise SpecError("spec is not a JSON object")
@@ -67,25 +101,37 @@ def validate_spec(spec: dict, max_params: int = 4) -> dict:
 
     clean = {}
     for name, values in grid.items():
-        if not isinstance(name, str) or not name.isidentifier():
+        if not isinstance(name, str) or not name.isidentifier() or keyword.iskeyword(name):
             raise SpecError(f"parameter name {name!r} is not a valid python identifier")
+        if name == "prices":
+            raise SpecError("'prices' can't be a parameter name: positions() already takes prices")
         values = values if isinstance(values, list) else [values]
-        numbers = [v for v in values if isinstance(v, int | float) and not isinstance(v, bool)]
+        numbers = {_parameter_value(v) for v in values} - {None}
         if not numbers:
-            raise SpecError(f"parameter {name!r} has no numeric values")
-        clean[name] = sorted({int(v) if float(v).is_integer() else float(v) for v in numbers})
+            raise SpecError(f"parameter {name!r} has no finite numeric values")
+        if len(numbers) > max_values:
+            raise SpecError(
+                f"parameter {name!r} has {len(numbers)} values; use at most {max_values}"
+            )
+        clean[name] = sorted(numbers)
     if len(clean) > max_params:
         raise SpecError(f"{len(clean)} parameters; use at most {max_params}")
     if math.prod(len(values) for values in clean.values()) < 2:
         raise SpecError("the grid has only one configuration; give a parameter several values")
 
-    queries = spec.get("search_queries") or []
+    queries = spec.get("search_queries")
+    if isinstance(queries, str):
+        queries = [queries]
+    elif not isinstance(queries, list):
+        queries = []
+    family = spec.get("family")  # only the built-in library's own specs name a family
     return {
         **spec,
         "param_grid": clean,
         "search_queries": [q for q in queries if isinstance(q, str)][:3],
         "name": str(spec.get("name") or "Strategy"),
         "hypothesis": str(spec.get("hypothesis") or ""),
+        "family": family if isinstance(family, str) and family in library.FAMILIES else None,
     }
 
 
@@ -122,7 +168,9 @@ def positions(prices: pd.DataFrame, **params) -> pd.DataFrame
 - It is also run on shorter histories, down to the first few days, to check
   that no position uses the future. It must work on any length: return 0
   weight wherever there is not enough data yet (including warm-up NaNs).
-- Only import numpy and pandas. No I/O, no randomness, no network."""
+- Only import numpy and pandas (math and similar pure helpers are fine). No
+  I/O, no randomness, no network, and nothing beyond the prices argument: no
+  files, no globals(), getattr() or Python internals, no changes to modules."""
 
 
 def write_code(llm: LLM, spec: dict, error: str | None = None, previous: str | None = None) -> str:
@@ -137,7 +185,7 @@ def write_code(llm: LLM, spec: dict, error: str | None = None, previous: str | N
             f"\n\nYour previous code failed with:\n{error}\n\nPrevious code:\n{previous}\nFix it."
         )
 
-    family = library.FAMILIES.get(spec.get("family"), library.FAMILIES[library.DEFAULT])
+    family = library.family_of(spec)
     demo_code = family.fixed_code if (error and family.fixed_code) else family.code
     reply = llm.chat(
         "coder-repair" if error else "coder",
@@ -151,16 +199,172 @@ def write_code(llm: LLM, spec: dict, error: str | None = None, previous: str | N
 
 
 # --- auditor ---
-# Cheap pattern checks that run before the model review. They are only a first
-# line: the time-travel test in the harness is what actually catches leaks.
+# Cheap pattern checks that run before the model review. The look-ahead patterns
+# are only a first line: the time-travel test in the harness is what actually
+# catches leaks.
 LOOKAHEAD_PATTERNS = [
     (r"shift\(\s*-\s*\d+", "negative shift reads future rows"),
     (r"\.bfill\(|fillna\([^)]*method\s*=\s*['\"](bfill|backfill)", "back-fill leaks future values"),
     (r"iloc\[[^\]]*\+\s*1", "indexing i+1 may read tomorrow"),
     (r"center\s*=\s*True", "centred rolling window uses future data"),
-    (r"import\s+(os|sys|subprocess|requests|socket)", "forbidden import"),
 ]
 RISK_LEVELS = ("low", "medium", "high")
+
+# What `escapes` allows and looks for. Code that reaches outside the prices it is
+# given could find the full history elsewhere (a file, the interpreter's memory,
+# state left in a shared module), which the time-travel test can't rule out.
+SAFE_MODULES = {  # numpy, pandas and pure standard-library helpers with no I/O
+    "numpy",
+    "pandas",
+    "math",
+    "cmath",
+    "statistics",
+    "decimal",
+    "fractions",
+    "numbers",
+    "typing",
+    "dataclasses",
+    "enum",
+    "abc",
+    "functools",
+    "itertools",
+    "operator",
+    "collections",
+    "bisect",
+    "heapq",
+    "copy",
+    "re",
+    "string",
+    "datetime",
+    "warnings",
+    "__future__",
+}
+REACHING_BUILTINS = {
+    "open",
+    "eval",
+    "exec",
+    "compile",
+    "globals",
+    "locals",
+    "vars",
+    "getattr",
+    "setattr",
+    "delattr",
+    "__import__",
+    "breakpoint",
+    "input",
+}
+FILE_ATTRIBUTES = {  # besides read_* and save*
+    "load",
+    "loadtxt",
+    "genfromtxt",
+    "fromfile",
+    "memmap",
+    "tofile",
+    "to_csv",
+    "to_pickle",
+    "to_parquet",
+    "to_json",
+    "to_excel",
+    "to_feather",
+    "to_hdf",
+    "to_sql",
+    "to_html",
+    "to_xml",
+    "to_stata",
+    "to_orc",
+    "to_clipboard",
+    "to_latex",
+    "to_markdown",
+}
+STRING_EVALUATORS = {"eval", "query"}  # pandas; harmless unless pointed at other frames
+FRAME_KEYWORDS = {"level", "local_dict", "global_dict", "resolvers"}
+SAFE_DUNDERS = {"__name__", "__init__", "__all__", "__doc__"}
+
+
+def escapes(code: str) -> list[str]:
+    """Ways the code reaches outside the prices it is given, found in its syntax tree.
+
+    Imports beyond numpy, pandas and pure standard-library helpers; built-ins
+    that reach into the interpreter or the file system; reading or writing
+    files; pandas eval or query pointed at other frames; Python's internals
+    (dunder names); and changes to an imported module or class, which outlive
+    the run. A trial sends any of these back to the engineer; if they stay,
+    the audit risk is high and the evidence room stays shut. A block under
+    `if __name__ == "__main__":` never runs, so it is skipped. Code that
+    doesn't parse has nothing to report: it can't run either.
+    """
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return []
+    tree.body = [node for node in tree.body if not _is_main_block(node)]
+    imported = {
+        (alias.asname or alias.name).split(".")[0]
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Import | ast.ImportFrom)
+        for alias in node.names
+    }
+    found = {_escape(node) for node in ast.walk(tree)}
+    found |= {_shared_change(node, imported) for node in ast.walk(tree)}
+    return sorted(found - {None})
+
+
+def _is_main_block(node: ast.AST) -> bool:
+    """Is this `if __name__ == "__main__":`, which never runs when the harness loads the code?"""
+    test = getattr(node, "test", None)
+    return (
+        isinstance(node, ast.If)
+        and isinstance(test, ast.Compare)
+        and isinstance(test.left, ast.Name)
+        and test.left.id == "__name__"
+        and any(getattr(c, "value", None) == "__main__" for c in test.comparators)
+    )
+
+
+def _shared_change(node: ast.AST, imported: set[str]) -> str | None:
+    """An assignment to an attribute or item of something imported: state that outlives a run."""
+    if isinstance(node, ast.Assign | ast.Delete):
+        targets = node.targets
+    elif isinstance(node, ast.AugAssign | ast.AnnAssign):
+        targets = [node.target]
+    else:
+        return None
+    for target in targets:
+        root = target
+        while isinstance(root, ast.Attribute | ast.Subscript):
+            root = root.value
+        if root is not target and isinstance(root, ast.Name) and root.id in imported:
+            return f"changes {root.id}, which is shared with every other run"
+    return None
+
+
+def _escape(node: ast.AST) -> str | None:
+    """What, if anything, one node of a syntax tree reaches outside its arguments for."""
+    if isinstance(node, ast.Import):
+        modules = [alias.name for alias in node.names]
+    elif isinstance(node, ast.ImportFrom):
+        modules = [node.module or ""]  # a relative import has no module name
+    else:
+        modules = []
+    if any(module.split(".")[0] not in SAFE_MODULES for module in modules):
+        return "imports a module other than numpy, pandas and pure standard-library helpers"
+    if isinstance(node, ast.Call):
+        called = getattr(node.func, "id", None) or getattr(node.func, "attr", None)
+        if isinstance(node.func, ast.Name) and called in REACHING_BUILTINS:
+            return f"calls {called}(), which can reach beyond its arguments"
+        frames = any(kw.arg in FRAME_KEYWORDS for kw in node.keywords)
+        if isinstance(node.func, ast.Attribute) and called in STRING_EVALUATORS and frames:
+            return f"points .{called}() at other frames"
+    name = getattr(node, "attr", None) or getattr(node, "id", None) or ""
+    if name.startswith("__") and name.endswith("__") and name not in SAFE_DUNDERS:
+        return f"uses Python internals ({name})"
+    if isinstance(node, ast.Attribute) and (
+        name.startswith(("read_", "save")) or name in FILE_ATTRIBUTES
+    ):
+        return f"reads or writes files (.{name})"
+    return None
+
 
 AUDITOR_SYS = """You audit trading code for look-ahead bias and data leakage.
 Reply JSON only: {"risk": "low"|"medium"|"high", "issues": [str, ...]}.
@@ -170,11 +374,14 @@ Full-sample normalisation, future shifts, back-fills and centred windows are hig
 def audit(llm: LLM, code: str) -> dict:
     """Static patterns plus a Nemotron Nano review.
 
-    A pattern hit is at least medium risk, and so is a risk level the model
-    states in a form we can't read: an unreadable answer is not a clean bill.
+    A look-ahead pattern is at least medium risk, and so is a review we can't
+    read (or a risk level stated in a form we don't recognise): no clean bill
+    is not a clean bill. Code that reaches outside its prices is high risk.
     """
-    static = [message for pattern, message in LOOKAHEAD_PATTERNS if re.search(pattern, code)]
-    review = llm.chat_json(
+    reaches_out = escapes(code)
+    static = [msg for pattern, msg in LOOKAHEAD_PATTERNS if re.search(pattern, code)] + reaches_out
+    review, failure = _advice(
+        llm,
         "auditor",
         "nano",
         AUDITOR_SYS,
@@ -182,16 +389,20 @@ def audit(llm: LLM, code: str) -> dict:
         mock=lambda: json.dumps({"risk": "high" if static else "low", "issues": static}),
         max_tokens=800,
     )
-    risk = str(review.get("risk", "")).strip().lower()
-    if risk not in RISK_LEVELS:
+    issues = set(static)
+    if review is None:
         risk = "medium"
+        issues.add(f"The auditor's review could not be read ({failure}).")
+    else:
+        risk = str(review.get("risk", "")).strip().lower()
+        if risk not in RISK_LEVELS:
+            risk = "medium"
+        issues |= set(_strings(review.get("issues")))
     if static and risk == "low":
         risk = "medium"
-    return {
-        "risk": risk,
-        "issues": sorted(set(static) | set(_strings(review.get("issues")))),
-        "static_hits": static,
-    }
+    if reaches_out:
+        risk = "high"
+    return {"risk": risk, "issues": sorted(issues), "static_hits": static, "escapes": reaches_out}
 
 
 # --- clerk ---
@@ -209,13 +420,18 @@ def triage_prior_art(llm: LLM, spec: dict, hits: list[dict], note: str | None = 
     if not found:
         return {"already_known": None, "summary": note or "Nothing was found.", "citations": []}
     user = f"Idea: {spec.get('hypothesis')}\n\nResults:\n{json.dumps(found, indent=1)}"
-    reply = llm.chat_json("clerk", "nano", CLERK_SYS, user, mock=lambda: "{}", max_tokens=800)
+    reply, failure = _advice(
+        llm, "clerk", "nano", CLERK_SYS, user, mock=lambda: "{}", max_tokens=800
+    )
+    if reply is None:
+        summary = f"The prior-art triage failed ({failure})."
+        return {"already_known": None, "summary": summary, "citations": []}
     titles = {hit["url"]: hit.get("title") or hit["url"] for hit in found}
     cited = reply.get("citations") if isinstance(reply.get("citations"), list) else []
     citations = [
         {"title": titles[c["url"]], "url": c["url"]}  # the search's own title, not the model's
         for c in cited
-        if isinstance(c, dict) and c.get("url") in titles
+        if isinstance(c, dict) and isinstance(c.get("url"), str) and c["url"] in titles
     ]
     known = reply.get("already_known")
     return {
@@ -237,10 +453,14 @@ luck struggles to explain the result. It is NOT the probability that the
 strategy is real, so never describe it that way. distinct_bets_total is how
 many genuinely independent bets the configurations amount to (random matrix
 theory), which can be far fewer than the number of configurations;
-prob_oos_loss is how often the in-sample winner loses money out of sample; pbo
-is only about whether the exact parameters were overfit, and a high pbo with a
-low prob_oos_loss means the parameters don't matter but the strategy family
-works. years_of_live_trading_to_prove_it is how long a live record at the
+prob_oos_loss is the share of train/test splits in which the in-sample winner
+loses money out of sample; pbo is the share of those splits in which it ranks
+in the bottom half out of sample, which is only about whether the exact
+parameters matter: a high pbo with a low prob_oos_loss means the parameters
+don't matter but the strategy family works. deflated_sharpe is a confidence
+level from an analytic test that assumes independent trials, reported for
+reference only; like p_value, it is not the probability that the strategy is
+real. years_of_live_trading_to_prove_it is how long a live record at the
 walk-forward Sharpe would need to run to show its Sharpe is above zero.
 time_travel reports the harness test that re-runs the strategy on truncated
 history: if it FAILED, the code read the future or could not be shown not to,
@@ -259,11 +479,14 @@ VERDICT_WORDS = {
 def judge(llm: LLM, verdict: str, evidence: dict) -> dict:
     """Nemotron Ultra explains a verdict that the statistics have already decided.
 
-    The reply is normalised, and if its headline names a different verdict, or
-    it gives no reasoning, the court's own explanation is used instead.
+    The reply is normalised. Any part of it that can't be used (all of it, if
+    no reply came back) is replaced with the court's own explanation, and the
+    opinion's "note" says which: a headline naming a different verdict, or an
+    empty headline, reasoning or list of what would change the verdict.
     """
     fallback = court_opinion(verdict, evidence)
-    reply = llm.chat_json(
+    reply, failure = _advice(
+        llm,
         "judge",
         "ultra",
         JUDGE_SYS,
@@ -271,17 +494,28 @@ def judge(llm: LLM, verdict: str, evidence: dict) -> dict:
         mock=lambda: json.dumps(fallback),
         max_tokens=1200,
     )
+    if reply is None:
+        return {
+            **fallback,
+            "note": f"The court's own opinion: the judge's reply failed ({failure}).",
+        }
     headline = str(reply.get("headline") or "").strip()
-    contradicts = any(
+    if any(
         pattern.search(headline) for other, pattern in VERDICT_WORDS.items() if other != verdict
-    )
-    reasoning = _strings(reply.get("reasoning"), limit=5)
-    return {
-        "headline": fallback["headline"] if contradicts or not headline else headline,
-        "reasoning": reasoning or fallback["reasoning"],
-        "what_would_change_my_mind": _strings(reply.get("what_would_change_my_mind"), limit=4)
-        or fallback["what_would_change_my_mind"],
+    ):
+        headline = ""  # it names a different verdict: never shown
+    opinion = {
+        "headline": headline,
+        "reasoning": _strings(reply.get("reasoning"), limit=5),
+        "what_would_change_my_mind": _strings(reply.get("what_would_change_my_mind"), limit=4),
     }
+    replaced = [part for part, value in opinion.items() if not value]
+    for part in replaced:
+        opinion[part] = fallback[part]
+    if replaced:
+        parts = ", ".join(part.replace("_", " ") for part in replaced)
+        opinion["note"] = f"The court's own {parts}: the judge's could not be used."
+    return opinion
 
 
 def court_opinion(verdict: str, e: dict) -> dict:
@@ -351,8 +585,9 @@ def court_opinion(verdict: str, e: dict) -> dict:
             f"resamples (the Reality Check's {fmt_p(e['p_value'])}). {proof}",
             f"The in-sample winner lost money out of sample in {e['prob_oos_loss']:.0%} of "
             f"train/test splits, and chosen walk-forward its Sharpe is "
-            f"{e['walk_forward_sharpe']:.2f}. (Probability the exact parameters were overfit: "
-            f"{e['pbo']:.0%}.)",
+            f"{e['walk_forward_sharpe']:.2f}. (It ranked in the bottom half out of sample in "
+            f"{e['pbo']:.0%} of splits, a measure of how much the exact parameter choice was "
+            "luck.)",
         ],
         "what_would_change_my_mind": [
             "Committing to one configuration and passing the sealed evidence test",

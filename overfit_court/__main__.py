@@ -19,7 +19,7 @@ from pathlib import Path
 from .data import PLANTED_SIGNAL, load_csv, synthetic_prices
 from .fishing import run_expedition
 from .ledger import Ledger, record_key
-from .pipeline import SEALED_FRACTION, run_trial, unseal
+from .pipeline import SEALED_FRACTION, TimeTravelError, run_trial, unseal
 from .report import court_record_markdown
 
 DEFAULT_LEDGER = os.getenv("OC_LEDGER_DIR", "~/.overfit_court")
@@ -54,12 +54,20 @@ def trial_command(argv: list[str]) -> None:
 
     prices, ledger = _prices_and_ledger(args)
     trial = run_trial(args.idea, prices, ledger=ledger)
-    if args.unseal and trial.passed_time_travel:
-        unseal(trial)
+    problem = None
+    if args.unseal:
+        try:
+            unseal(trial)
+        except TimeTravelError as e:
+            problem = f"The evidence room was not opened, or its result is void: {e}"
+        except Exception as e:  # a sandbox or network failure: the trial's report is still written
+            problem = f"The evidence room could not be opened ({type(e).__name__}: {e})."
     markdown = court_record_markdown(trial)
     Path(f"{args.out}.md").write_text(markdown)
     Path(f"{args.out}.json").write_text(trial.to_json())
     print("\n" + markdown)
+    if problem:
+        print(f"\n{problem}")
 
 
 def fish_command(argv: list[str]) -> None:

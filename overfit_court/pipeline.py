@@ -7,22 +7,24 @@ run_trial(idea, prices)
                  configuration on the OPEN evidence and time-travel tests each
                  one. A crash, a leak, or code the test can't verify goes back to
                  Super for repair.
-    4. audit     Static patterns plus a Nemotron Nano review of the final code.
+    4. audit     Static patterns plus a Nemotron Nano review of the code judged.
     5. judge     Statistics over the whole court record decide the verdict;
                  Nemotron Ultra explains it.
-    6. record    The trial's configurations join the court record.
+    6. record    From the first backtest on, the trial joins the court record
+                 whatever happens: if no verdict is reached, as a mistrial.
 
 unseal(trial)
     Commit to the winning configuration and record the opening first, then test
-    it once on the SEALED evidence in a fresh executor run. Research never
-    receives the sealed dates, so neither the model nor its code can have seen them.
+    it once on the SEALED evidence in a fresh executor run, time-travel tested
+    at every sealed day. Research never receives the sealed dates, so neither
+    the model nor its code can have seen them.
 """
 
 from __future__ import annotations
 
 import hashlib
-import itertools
 import json
+import math
 import random
 import time
 from collections.abc import Callable, Sequence
@@ -42,7 +44,7 @@ from .ledger import Ledger, record_key, record_seed
 from .llm import LLM
 from .research import prior_art
 from .sandbox import ExecutionResult, get_executor
-from .stats import ACQUITTED, CONFIRMED, CONVICTED, HUNG_JURY, INCONCLUSIVE, REFUTED
+from .stats import ACQUITTED, CONFIRMED, CONVICTED, HUNG_JURY, INCONCLUSIVE, MISTRIAL, REFUTED
 
 Log = Callable[[str], None]
 
@@ -65,15 +67,28 @@ HARNESS_SHA256 = hashlib.sha256(Path(_harness.__file__).read_bytes()).hexdigest(
 def expand_grid(param_grid: dict, max_configs: int, seed: int = 0) -> dict:
     """Every combination of parameter values, as {"c000": params, ...}.
 
-    Grids larger than `max_configs` are sampled down reproducibly.
+    Grids larger than `max_configs` are sampled down reproducibly, without
+    listing every combination first (a model may propose a huge grid).
     """
-    names = list(param_grid)
-    combos = [
-        dict(zip(names, values, strict=True)) for values in itertools.product(*param_grid.values())
-    ]
-    if len(combos) > max_configs:
-        combos = random.Random(seed).sample(combos, max_configs)
-    return {f"c{i:03d}": params for i, params in enumerate(combos)}
+    names, values = list(param_grid), list(param_grid.values())
+    total = math.prod(len(v) for v in values)
+    if total > max_configs:
+        picks = sorted(random.Random(seed).sample(range(total), max_configs))
+    else:
+        picks = range(total)
+    return {
+        f"c{i:03d}": dict(zip(names, _combination(values, n), strict=True))
+        for i, n in enumerate(picks)
+    }
+
+
+def _combination(values: list, n: int) -> list:
+    """The n-th combination, in the order itertools.product lists them."""
+    combo = []
+    for options in reversed(values):
+        n, choice = divmod(n, len(options))
+        combo.append(options[choice])
+    return combo[::-1]
 
 
 def split_sealed(prices: pd.DataFrame, sealed_fraction: float = SEALED_FRACTION):
@@ -236,7 +251,7 @@ class SealedResult:
 class Trial:
     idea: str
     spec: dict
-    code: str  # the final version, after any repairs
+    code: str  # the version judged: the latest that ran properly, after any repairs
     verdict: str  # CONVICTED, HUNG JURY or ACQUITTED
     findings: Findings
     returns: pd.DataFrame  # daily returns of every configuration, open evidence only
@@ -248,8 +263,8 @@ class Trial:
     cut: pd.Timestamp | None  # first sealed date
     sealed_fraction: float
     cost_bps: float  # trading cost of the trial; the evidence room uses the same
-    time_travel: dict | None  # the time-travel report for the final code
-    code_history: list  # every attempt: code, problem found, time-travel report
+    time_travel: dict | None  # the time-travel report for the code judged
+    code_history: list  # every attempt: code, problem found, time-travel report, judged or not
     ledger: Ledger = field(repr=False)  # the court record, where seal openings are noted too
     prices_full: pd.DataFrame = field(repr=False)  # open and sealed evidence
     opinion: dict = field(default_factory=dict)  # the judge's explanation
@@ -259,6 +274,7 @@ class Trial:
     data_source: str = ""
     executor: str = "local"
     sealed: SealedResult | None = None
+    failed_opening: str | None = None  # why an opening of the seal gave no valid result
 
     @property
     def time_travel_status(self) -> str:
@@ -267,20 +283,33 @@ class Trial:
 
     @property
     def passed_time_travel(self) -> bool:
-        """Every configuration of the final code was checked, and none reads the future."""
+        """Every configuration of the code judged was checked, and none reads the future."""
         return self.time_travel_status == PASSED
 
     @property
     def time_traveller(self) -> bool:
-        """The final code still reads the future."""
+        """The code judged still reads the future."""
         return self.time_travel_status == LEAKED
 
     @property
+    def judged_attempt(self) -> int:
+        """Which attempt's code was judged (usually the last)."""
+        marked = [a["attempt"] for a in self.code_history if a.get("judged")]
+        return marked[-1] if marked else len(self.code_history)
+
+    @property
+    def first_leak(self) -> dict | None:
+        """The first attempt the time-travel test caught reading the future, if any."""
+        attempts = self.code_history
+        return next((a for a in attempts if (a["time_travel"] or {}).get("status") == LEAKED), None)
+
+    @property
     def caught_and_repaired(self) -> bool:
-        """An earlier draft read the future, and the repaired code passes the test."""
-        earlier = self.code_history[:-1]
-        leaked_before = any((a["time_travel"] or {}).get("status") == LEAKED for a in earlier)
-        return leaked_before and self.time_travel_status == PASSED
+        """A draft read the future, and a later version, the one judged, passes the test."""
+        leak = self.first_leak
+        return (
+            leak is not None and leak["attempt"] < self.judged_attempt and self.passed_time_travel
+        )
 
     def evidence(self) -> dict:
         """The numbers behind the verdict: what the judge model sees and the app shows."""
@@ -332,6 +361,13 @@ class Trial:
             "prior_art_known": self.prior_art.get("already_known"),
         }
 
+    def _sealed_evidence(self):
+        if self.sealed:
+            return self.sealed.to_dict()
+        if self.failed_opening:
+            return {"opened": True, "valid_result": False, "why": self.failed_opening}
+        return "still sealed"
+
     def to_json(self) -> str:
         """The full report: everything needed to reproduce or audit the verdict."""
         return json.dumps(
@@ -349,7 +385,7 @@ class Trial:
                 "distinct_bets": self.findings.spectrum.to_dict(),
                 "time_travel": self.time_travel,
                 "code_history": self.code_history,
-                "sealed_evidence": self.sealed.to_dict() if self.sealed else "still sealed",
+                "sealed_evidence": self._sealed_evidence(),
                 "cost_table": self.cost_table,
                 "execution": self.execution,
                 "timings": self.timings,
@@ -363,6 +399,10 @@ class Trial:
 
 
 # --- the trial ---
+class Mistrial(RuntimeError):
+    """The trial could not reach a verdict. It is still on the court record, as a mistrial."""
+
+
 def run_trial(
     idea: str,
     prices: pd.DataFrame | None = None,
@@ -409,92 +449,111 @@ def run_trial(
         hits, search_note = prior_art(spec["search_queries"], settings)
         found = agents.triage_prior_art(llm, spec, hits, search_note)
 
-    # 3. build: write, run, time-travel test, repair
-    with _timed(timings, "build_s"):
-        code, result, attempts = _build(
-            llm=llm,
+    # From the first backtest on, the trial goes on the court record whatever
+    # happens: configurations that ran were research on this data, even if the
+    # trial never reaches a verdict.
+    verdict = MISTRIAL  # until the court rules
+    runs: list[pd.DataFrame] = []  # the returns of every executor run, latest last
+    recorded = None  # the returns that join the record
+    try:
+        # 3. build: write, run, time-travel test, repair
+        with _timed(timings, "build_s"):
+            code, result, attempts = _build(
+                llm=llm,
+                spec=spec,
+                grid=grid,
+                first_draft=first_draft,
+                executor=executor,
+                open_prices=open_prices,
+                cut=cut,
+                cost_bps=settings.cost_bps,
+                max_repairs=max_repairs,
+                runs=runs,
+                log=log,
+            )
+        recorded = result.returns
+        time_travel_status = (result.time_travel or {}).get("status")
+
+        # 4. audit
+        log("Auditing the code for look-ahead bias (Nemotron Nano)...")
+        audit = agents.audit(llm, code)
+        if time_travel_status != PASSED:
+            audit["risk"] = "high"
+            audit["issues"] = [_harness.describe(result.time_travel), *audit["issues"]]
+
+        # 5. judge
+        log("Reality Check over the whole court record, distinct bets, CSCV, walk-forward...")
+        with _timed(timings, "stats_s"):
+            findings = judge_statistics(
+                result.returns,
+                result.grid,
+                prior=ledger.prior_returns(key),
+                seed=record_seed(key),
+                n_boot=n_boot,
+            )
+        history = ledger.history(key)
+        data_source = describe_data(prices_full)
+        if prices is None:
+            data_source = f"synthetic pure noise, {data_source}"
+        trial = Trial(
+            idea=idea,
             spec=spec,
-            grid=grid,
-            first_draft=first_draft,
-            executor=executor,
-            open_prices=open_prices,
+            code=code,
+            verdict=final_verdict(findings.verdict, time_travel_status, audit["risk"]),
+            findings=findings,
+            returns=result.returns,
+            grid=result.grid,
+            errors=result.errors,
+            audit=audit,
+            prior_art=found,
+            record={
+                "dataset": key,
+                "trial_number": len(history) + 1,
+                "previous": [
+                    {"idea": h["idea"], "configs": h["n"], "verdict": h["verdict"]} for h in history
+                ],
+                "sealed_openings": len(ledger.seals(key)),
+            },
             cut=cut,
+            sealed_fraction=sealed_fraction,
             cost_bps=settings.cost_bps,
-            max_repairs=max_repairs,
-            log=log,
+            time_travel=result.time_travel,
+            code_history=attempts,
+            ledger=ledger,
+            prices_full=prices_full,
+            execution={**result.summary(), "setup": result.setup},
+            timings=timings,
+            data_source=data_source,
+            executor=executor.name,
         )
-    time_travel_status = (result.time_travel or {}).get("status")
-
-    # 4. audit
-    log("Auditing the code for look-ahead bias (Nemotron Nano)...")
-    audit = agents.audit(llm, code)
-    if time_travel_status != PASSED:
-        audit["risk"] = "high"
-        audit["issues"] = [_harness.describe(result.time_travel), *audit["issues"]]
-
-    # 5. judge
-    log("Reality Check over the whole court record, distinct bets, CSCV, walk-forward...")
-    with _timed(timings, "stats_s"):
-        findings = judge_statistics(
-            result.returns,
-            result.grid,
-            prior=ledger.prior_returns(key),
-            seed=record_seed(key),
-            n_boot=n_boot,
-        )
-    history = ledger.history(key)
-    data_source = describe_data(prices_full)
-    if prices is None:
-        data_source = f"synthetic pure noise, {data_source}"
-    trial = Trial(
-        idea=idea,
-        spec=spec,
-        code=code,
-        verdict=final_verdict(findings.verdict, time_travel_status, audit["risk"]),
-        findings=findings,
-        returns=result.returns,
-        grid=result.grid,
-        errors=result.errors,
-        audit=audit,
-        prior_art=found,
-        record={
-            "dataset": key,
-            "trial_number": len(history) + 1,
-            "previous": [
-                {"idea": h["idea"], "configs": h["n"], "verdict": h["verdict"]} for h in history
-            ],
-            "sealed_openings": len(ledger.seals(key)),
-        },
-        cut=cut,
-        sealed_fraction=sealed_fraction,
-        cost_bps=settings.cost_bps,
-        time_travel=result.time_travel,
-        code_history=attempts,
-        ledger=ledger,
-        prices_full=prices_full,
-        execution={**result.summary(), "setup": result.setup},
-        timings=timings,
-        data_source=data_source,
-        executor=executor.name,
-    )
-    log("Writing the judgment (Nemotron Ultra)...")
-    trial.opinion = agents.judge(llm, trial.verdict, trial.evidence())
-    trial.cost_table = llm.cost_table()
-
-    # 6. record
-    ledger.record(key, idea, result.returns.to_numpy(), trial.verdict, spec.get("family"))
+        log("Writing the judgment (Nemotron Ultra)...")
+        trial.opinion = agents.judge(llm, trial.verdict, trial.evidence())
+        trial.cost_table = llm.cost_table()
+        verdict = trial.verdict
+    finally:
+        # 6. record. With no version judged, the latest run is what was tried. If no
+        # configuration ever ran, nothing was tried on this data, and nothing is recorded.
+        if recorded is None and runs:
+            recorded = runs[-1]
+        if recorded is not None and recorded.shape[1] > 0:
+            ledger.record(key, idea, recorded.to_numpy(), verdict, spec.get("family"))
     return trial
 
 
 def _build(
-    *, llm, spec, grid, first_draft, executor, open_prices, cut, cost_bps, max_repairs, log
+    *, llm, spec, grid, first_draft, executor, open_prices, cut, cost_bps, max_repairs, runs, log
 ) -> tuple[str, ExecutionResult, list[dict]]:
     """Write the strategy, backtest and time-travel test every configuration, repair on failure.
 
-    A crash, parameters that change nothing, or a time-travel test that finds a
-    leak or cannot run, goes back to Nemotron Super with the exact problem (for
-    a leak: the parameters and dates). After `max_repairs` repairs the last
-    attempt stands. Returns (final code, its results, every attempt).
+    A crash, parameters that change nothing, a time-travel test that finds a
+    leak or cannot run, or code that reaches outside the prices it is given,
+    goes back to Nemotron Super with the exact problem (for a leak: the
+    parameters and dates). After `max_repairs` repairs the last attempt stands,
+    unless a repair broke the strategy outright: then the last version that did
+    run is judged, problems and all. Results the sandbox service lost are no
+    fault of the code, so they end the trial as a mistrial instead of going
+    back for repair. Every run's returns are appended to `runs` as they arrive.
+    Returns (the code judged, its results, every attempt).
     """
     if first_draft is None:
         log("Writing the strategy (Nemotron Super)...")
@@ -504,6 +563,7 @@ def _build(
     withheld = "" if cut is None else f", sealed evidence from {cut.date()} withheld"
 
     attempts = []
+    judged = None  # (attempt, code, result): the latest with two or more distinct configurations
     for attempt in range(1, max_repairs + 2):
         log(
             f"Running {len(grid)} configurations, each with the time-travel test, in parallel "
@@ -513,14 +573,31 @@ def _build(
         flat = result.returns.columns.difference(drop_flat(result.returns).columns)
         result.errors.update(dict.fromkeys(flat, "never trades (zero variance)"))
         result.returns = drop_flat(result.returns)
+        runs.append(result.returns)
+        report = result.time_travel or {}
+        if report.get("lost_configs"):
+            raise Mistrial(
+                f"The sandbox service lost part of the run, even after a retry: {report['error']}. "
+                "That's no fault of the strategy, so nothing was judged."
+            )
+        usable = stats.distinct_columns(result.returns.to_numpy()).shape[1] >= 2
+        if usable:
+            judged = (attempt, code, result)
 
+        reaches_out = agents.escapes(code)
         problem = None
         if result.returns.shape[1] < max(2, len(grid) // 2):
             problem = next(iter(result.errors.values()), "no configurations produced returns")
-        elif stats.distinct_columns(result.returns.to_numpy()).shape[1] < 2:
+        elif not usable:
             problem = IDENTICAL
         elif not _harness.passed(result.time_travel):
             problem = _harness.describe(result.time_travel)
+        elif reaches_out:
+            problem = (
+                f"The code reaches outside the prices it is given ({'; '.join(reaches_out)}), "
+                "so the time-travel test can't vouch for it. Use only numpy, pandas and the "
+                "prices argument."
+            )
         attempts.append(
             {
                 "attempt": attempt,
@@ -532,20 +609,42 @@ def _build(
         if problem is None or attempt > max_repairs:
             break
         log(f"{problem[:200]} Sending it back to Nemotron Super for repair...")
-        code = agents.write_code(llm, spec, error=problem, previous=code)
+        try:
+            code = agents.write_code(llm, spec, error=problem, previous=code)
+        except Exception as e:  # no repair came back: what has been run is judged
+            log(f"The repair request failed ({type(e).__name__}: {e}).")
+            break
 
-    if result.returns.shape[1] < 2:
-        raise RuntimeError(
-            f"Fewer than two configurations ever produced returns. Errors: {result.errors}"
+    if judged is None:
+        raise Mistrial(
+            "No version of the strategy produced two distinct configurations that trade. "
+            f"Last errors: {result.errors}"
         )
-    if stats.distinct_columns(result.returns.to_numpy()).shape[1] < 2:
-        raise RuntimeError(IDENTICAL)
+    number, code, result = judged
+    attempts[number - 1]["judged"] = True
+    if number != len(attempts):
+        log("The last repair broke the strategy, so the last version that ran is judged.")
     return code, result, attempts
 
 
 # --- the evidence room ---
 class TimeTravelError(ValueError):
-    """The evidence room refuses, or voids, a strategy that reads the future."""
+    """The evidence room refuses, or voids, a strategy that reads the future or can't be
+    shown not to."""
+
+
+def sealed_cuts(prices: pd.DataFrame, cut) -> list[int]:
+    """The evidence room's extra time-travel cuts: histories ending on the last open day
+    and on every sealed day.
+
+    The room tests a single configuration, so it can afford to check every
+    sealed position: one that used even a day of the future changes as soon as
+    that day is cut off. The research phase's cuts are built for accidental
+    leaks, which touch most days; code written to cheat only between two of
+    them could get past those, but not past these.
+    """
+    first_sealed = int((prices.index < cut).sum())
+    return list(range(first_sealed, len(prices)))
 
 
 def commitment_hash(code: str, params: dict, *, key: str, cut, cost_bps: float) -> str:
@@ -586,19 +685,26 @@ def unseal_strategy(
 
     The opening is recorded with its commitment before anything runs, so it
     counts whatever happens next. The strategy then runs on the full history,
-    time-travel test included, and only the days from `cut` onwards are scored.
-    Each earlier opening was another chance to get lucky, so the p-value is
-    corrected for them (Sidak).
+    time-travel tested at every sealed day (sealed_cuts), and only the days
+    from `cut` onwards are scored. Each earlier opening was another chance to
+    get lucky, so the p-value is corrected for them (Sidak).
     """
     commitment = commitment_hash(code, params, key=key, cut=cut, cost_bps=cost_bps)
-    earlier_openings = len(ledger.seals(key))
-    ledger.record_seal_opening(key, commitment, params)
+    earlier_openings = ledger.record_seal_opening(key, commitment, params)
     log(
         f"Committed to {params} (commitment {commitment[:16]}). Opening the evidence room: a "
         "fresh run with the sealed data and only this one strategy..."
     )
 
-    result = executor.run(code, prices, {"committed": params}, cost_bps)
+    result = executor.run(
+        code, prices, {"committed": params}, cost_bps, extra_cuts=sealed_cuts(prices, cut)
+    )
+    if (result.time_travel or {}).get("lost_configs"):
+        ledger.record_seal_result(key, commitment, {"verdict": "failed to run: results lost"})
+        raise RuntimeError(
+            "The sandbox service lost part of the evidence room's run, even after a retry "
+            f"({result.time_travel['error']}). The opening still counts."
+        )
     if "committed" not in result.returns:
         ledger.record_seal_result(key, commitment, {"verdict": "failed to run"})
         raise RuntimeError(f"The committed strategy failed on the full data: {result.errors}")
@@ -651,7 +757,10 @@ def unseal(trial: Trial, *, executor=None, log: Log = print) -> SealedResult:
 
     Refused unless the strategy passed the time-travel test: one that reads
     the future would read the sealed evidence too, so the test would prove
-    nothing. The opening is recorded in the trial's own court record.
+    nothing. Refused too if the audit found the code reaching outside the
+    prices it is given (files, the interpreter's internals), which the
+    time-travel test can't vouch for. The opening is recorded in the trial's
+    own court record.
     """
     if trial.cut is None:
         raise ValueError("This trial was run without sealed evidence.")
@@ -663,16 +772,26 @@ def unseal(trial: Trial, *, executor=None, log: Log = print) -> SealedResult:
         raise TimeTravelError(
             f"The evidence room stays shut: {why}, so it could read the sealed evidence too."
         )
-    trial.sealed = unseal_strategy(
-        trial.code,
-        trial.findings.best_params,
-        open_sharpe=trial.findings.best_sharpe,
-        key=trial.record["dataset"],
-        cut=trial.cut,
-        cost_bps=trial.cost_bps,
-        prices=trial.prices_full,
-        executor=executor or get_executor(get_settings().executor),
-        ledger=trial.ledger,
-        log=log,
-    )
+    escapes = trial.audit.get("escapes") or []
+    if escapes:
+        raise TimeTravelError(
+            "The evidence room stays shut: the code reaches outside the prices it is given "
+            f"({'; '.join(escapes)}), so the time-travel test can't vouch for it."
+        )
+    try:
+        trial.sealed = unseal_strategy(
+            trial.code,
+            trial.findings.best_params,
+            open_sharpe=trial.findings.best_sharpe,
+            key=trial.record["dataset"],
+            cut=trial.cut,
+            cost_bps=trial.cost_bps,
+            prices=trial.prices_full,
+            executor=executor or get_executor(get_settings().executor),
+            ledger=trial.ledger,
+            log=log,
+        )
+    except Exception as e:  # the opening counts, so the trial's own record says what happened
+        trial.failed_opening = f"{type(e).__name__}: {e}"
+        raise
     return trial.sealed

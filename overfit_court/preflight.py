@@ -4,12 +4,16 @@ Checks, in order:
 
 1. Token Factory: the key works, and the three Nemotron model ids exist
    (if not, lists the Nemotron ids your account can see).
-2. One real call per tier, with latency, tokens and cost; and whether each tier
-   accepts JSON mode (if not, the client falls back to asking in the prompt).
+2. One real call per tier, asked the way the court's roles ask it: JSON mode,
+   and thinking on for Super and Ultra, off for Nano. The reply must parse.
+   Reports latency, tokens and cost, and any request part the model refused
+   (the client then works without it, as it would in a trial).
 3. Token Factory Sandboxes: a real small job through the real code path
    (dependencies image, trial checkpoint, parallel branches, each with the
    time-travel test, results read back), compared with the same job run locally.
 4. Tavily: one search.
+
+It ends with what to do next.
 """
 
 from __future__ import annotations
@@ -30,9 +34,13 @@ from .sandbox import LocalExecutor, NebiusSandboxExecutor
 
 PASS, FAIL, SKIP = "PASS", "FAIL", "SKIP"
 TIERS = ("nano", "super", "ultra")
+THINKS = {"nano": False, "super": True, "ultra": True}  # as the court's roles on each tier ask
+failures: list[str] = []  # every FAIL line, for the closing advice
 
 
 def report(status: str, what: str, detail: str = "") -> None:
+    if status == FAIL:
+        failures.append(what)
     print(f"[{status}] {what}" + (f"  ({detail})" if detail else ""))
 
 
@@ -48,9 +56,10 @@ def check_models(settings: Settings, llm: LLM) -> bool:
         return False
     report(PASS, f"Token Factory key works, {len(available)} models visible")
     all_found = True
-    for tier, model in settings.models.items():
+    for tier, configured in settings.models.items():
+        model = llm.model_for(tier)  # the listed id, if it differs only in case or prefix
         if model in available:
-            report(PASS, f"{tier}: {model}")
+            report(PASS, f"{tier}: {model}", "" if model == configured else f"set as {configured}")
         else:
             nemotron = sorted(m for m in available if "nemotron" in m.lower())
             report(
@@ -60,41 +69,36 @@ def check_models(settings: Settings, llm: LLM) -> bool:
     return all_found
 
 
-def check_calls(settings: Settings, llm: LLM) -> None:
+def check_calls(llm: LLM) -> None:
     for tier in TIERS:
+        thinks = THINKS[tier]
+        first = len(llm.calls)
         try:
-            reply = llm.chat(
+            reply = llm.chat_json(
                 "preflight",
                 tier,
-                "Reply with the single word: ready.",
+                'Reply with this JSON object: {"ready": true}',
                 "Status?",
-                mock=lambda: "ready",
-                max_tokens=400,
+                mock=lambda: '{"ready": true}',
+                reasoning=thinks,
+                max_tokens=4000 if thinks else 400,
             )
-            call = llm.calls[-1]
-            report(
-                PASS,
-                f"{tier} call",
-                f"{call.latency_s:.1f}s, {call.input_tokens}+{call.output_tokens} tokens, "
-                f"${call.cost_usd:.6f}, replied {reply[:30]!r}",
-            )
+            ok = reply.get("ready") is True
         except Exception as e:
-            report(FAIL, f"{tier} call", f"{type(e).__name__}: {e}")
-
-    for tier in TIERS:
-        try:
-            llm.client.chat.completions.create(
-                model=settings.models[tier],
-                max_tokens=200,
-                response_format={"type": "json_object"},
-                messages=[{"role": "user", "content": 'Reply with {"ok": true}'}],
-            )
-            report(PASS, f"{tier} accepts JSON mode")
-        except Exception as e:
+            ok, reply = False, f"{type(e).__name__}: {e}"
+        calls = llm.calls[first:]
+        report(
+            PASS if ok else FAIL,
+            f"{tier} call, thinking {'on' if thinks else 'off'}, JSON reply",
+            f"{len(calls)} request(s), {sum(c.latency_s for c in calls):.1f}s, "
+            f"{sum(c.input_tokens for c in calls)}+{sum(c.output_tokens for c in calls)} tokens, "
+            f"${sum(c.cost_usd for c in calls):.6f}, replied {str(reply)[:60]!r}",
+        )
+        for part in sorted(llm.refused.get(llm.model_for(tier), ())):
             report(
                 SKIP,
-                f"{tier} rejects JSON mode; the client will ask for JSON in the prompt instead",
-                f"{type(e).__name__}: {str(e)[:120]}",
+                f"{tier} refused {part}",
+                "the client now works without it, as it will in trials",
             )
 
 
@@ -153,6 +157,7 @@ def check_tavily(settings: Settings) -> None:
 
 
 def main() -> None:
+    failures.clear()
     settings = get_settings()
     print(f"Token Factory endpoint: {settings.base_url}\n")
     if settings.mock_llm:
@@ -160,12 +165,21 @@ def main() -> None:
     else:
         llm = LLM(settings)
         if check_models(settings, llm):
-            check_calls(settings, llm)
+            check_calls(llm)
         check_sandboxes()
     if settings.mock_search:
         report(SKIP, "Tavily", "TAVILY_API_KEY not set")
     else:
         check_tavily(settings)
+
+    print()
+    if failures:
+        print(f"{len(failures)} check(s) failed. Fix the FAIL lines above, then run this again.")
+    else:
+        print(
+            "Ready. Next: streamlit run app.py, or\n"
+            '  python -m overfit_court "buy assets that rose most over the past year"'
+        )
 
 
 if __name__ == "__main__":

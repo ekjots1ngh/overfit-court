@@ -1,38 +1,60 @@
-# ⚖️ Overfit Court
+# Overfit Court
 
 [![tests](https://github.com/ekjots1ngh/overfit-court/actions/workflows/tests.yml/badge.svg)](https://github.com/ekjots1ngh/overfit-court/actions/workflows/tests.yml)
 
 **AI agents can now try a thousand trading ideas before lunch. The more they try, the more they fool themselves. Overfit Court is the part that keeps count.**
 
-Describe a strategy in plain English. NVIDIA Nemotron models on Nebius Token Factory plan it, write it and run every variant in parallel Token Factory Sandboxes. Then four things no ordinary backtester does:
+![Act 2 of the demo: statistics alone acquit a strategy that reads the future; the time-travel test convicts it, and the sandbox branches show every configuration caught, then repaired](docs/images/act2.png)
+
+Describe a strategy in plain English. NVIDIA Nemotron models on Nebius Token Factory plan it, write it and run every variant in parallel Token Factory Sandboxes, and Tavily checks whether it has already been published. Then four things no ordinary backtester does:
 
 1. **The time-travel test.** Every configuration is re-run on history cut short at up to fourteen points, from the first two days to the first 95%. If a position on a past date changes when later data arrives, the code read the future. The leak goes back to Nemotron Super, with the exact dates, for repair. The test fails closed: code that can't be re-run on shorter history, or answers differently when run twice on the same data, is treated as if it reads the future.
 2. **The court remembers.** Every configuration ever tried on the data is kept, and a bootstrap Reality Check asks how often zero-edge versions of *all of them* would do as well as your pick.
-3. **Random matrix theory counts your real bets.** 460 configurations might be 22 genuinely different bets. The eigenvalues of everything tried give the count, once the correlation that unrelated strategies show by chance has been removed, and that chance correlation is measured from the data, because shared volatility regimes inflate it.
+3. **Random matrix theory counts your real bets.** 460 configurations might move in only 22 independent directions. The eigenvalues of everything tried give the count, once the correlation that unrelated strategies show by chance has been removed, and that chance correlation is measured from the data, because shared volatility regimes inflate it. Beside it the court reports luck's real number of tries: how many independent strategies would give luck the same best Sharpe as everything you tried.
 4. **Sealed evidence.** The last 25% of the data is never uploaded to a research sandbox. Commit to one strategy and it gets exactly one test there, in a fresh sandbox, with the time-travel test run again at every sealed day. The commitment, a SHA-256 hash of the code, parameters, data, trading costs and scoring harness, is recorded before the seal is opened.
 
 The statistics decide the verdict: **convicted, hung jury or acquitted.** The judge model only explains it.
 
-Built for the Nebius x NVIDIA Global AI Hackathon (Coding and Agentic Engineering track). **Try it:** the app's **▶ Start here** tab tells the whole story in three clicks.
+(A Sharpe ratio is a strategy's yearly return divided by how much that return swings. Above 1 is what most funds hope for. Try enough strategies on random prices, though, and luck alone gets there too.)
 
-## Result 1: send an AI fisherman into pure noise
+Built for the Nebius x NVIDIA Global AI Hackathon (Coding and Agentic Engineering track).
 
-Sandboxes that branch like git make it almost free for an agent to try path after path until something works. Statisticians call that the garden of forking paths. A fisherman agent is told to find a strategy with Sharpe ≥ 1 and given 40 attempts. Each attempt is a new branch: a strategy family (8 of them), parameters, and a choice of asset universe ("the effect only works on these stocks"). It stops the moment it hits the target, like a real p-hacker. Then four judges look at what it brings back.
+## Try it
+
+Python 3.10 or later (CI runs 3.12).
+
+```bash
+git clone https://github.com/ekjots1ngh/overfit-court && cd overfit-court
+pip install -r requirements.txt
+streamlit run app.py
+```
+
+With no keys it runs in demo mode: model replies are canned and ideas are matched to a built-in strategy library, but the backtests, the time-travel test, the statistics and the evidence room are all real. The **Start here** tab tells the whole story in three clicks. For the live models, sandboxes and search, see [Running it live](#running-it-live).
+
+## Result 1: send a fisherman into pure noise
+
+Sandboxes that branch like git make it almost free for an agent to try path after path until something works. Statisticians call that the garden of forking paths. A fisherman agent is told to find a strategy with Sharpe ≥ 1 and given 40 attempts. Each attempt is a new branch: a strategy family (8 of them), parameters, and a choice of asset universe ("the effect only works on these stocks"). It stops the moment it hits the target, like a real p-hacker. Then four judges look at what it brings back. In these 120 expeditions the fisherman is scripted (random exploration, then hill-climbing on whatever looks best: the moves any search agent makes), so the results reproduce offline; with `--nemotron`, Nemotron 3 Super chooses every attempt instead.
+
+![Act 1 of the demo: the fisherman's best Sharpe climbs past the target while what luck alone reaches rises behind it; then four judges rule on its claim](docs/images/act1.gif)
 
 60 expeditions on pure noise and 60 on markets with a planted real edge:
 
-| Market | Median branches | Median distinct bets | Hit Sharpe ≥ 1 | Standard test says real | Claim's-grid check says real | **Overfit Court acquits** | **Sealed evidence confirms** | **Both say real** |
-|---|---|---|---|---|---|---|---|---|
-| Pure noise | 460 | 22 | 8% | **82%** | 28% | **0%** | 3% | **0%** |
-| Planted edge | 24 | 9 | 100% | 100% | 100% | **90%** | 43% | **37%** |
+| Market | Median branches | Independent directions | Luck's real tries | Hit Sharpe ≥ 1 | Standard test says real | Claim's-grid check says real | Bonferroni says real | **Overfit Court acquits** | **Sealed evidence confirms** | **Both say real** |
+|---|---|---|---|---|---|---|---|---|---|---|
+| Pure noise | 460 | 22 | 150 | 8% | **82%** | 28% | 2% | **0%** | 3% | **0%** |
+| Planted edge | 24 | 9 | 15 | 100% | 100% | 100% | 92% | **90%** | 43% | **37%** |
+
+(Medians across expeditions. Independent directions: the random-matrix count of how many ways the branches really differ. Luck's real tries: how many independent strategies would give luck the same best Sharpe as all the branches did.)
 
 On data with nothing in it, a standard backtest significance test certified the fisherman's strategy as real **82% of the time**. Checking only the grid of the attempt it reported (selective reporting) still passed 28%. Overfit Court acquitted none. The sealed evidence is a single test at the 5% level, so on its own it confirmed 2 of the 60 noise claims, as such a test will; the court had not acquitted either of them, so nothing got past both. When there really is an edge, the fisherman finds it within a few attempts and the court acquits 90%.
+
+Bonferroni, the textbook correction (the claim's p-value times every branch walked), does almost as well here: it let 1 noise claim in 60 through and passed 92% of real edges. That is the point more than a rival to it. Bonferroni needs the exact count of branches, and a researcher who reports one strategy hands you no count to multiply by; the court has it because it kept every branch. It also treats 460 correlated branches as 460 chances, where luck really had about 150, so with more fishing and subtler edges it gives up power that the bootstrap keeps.
 
 Reproduce: `python -m examples.fishing_experiment 60` (about 15 minutes on a laptop). With `--nemotron` and a key, Nemotron 3 Super does the fishing instead of the scripted fisherman.
 
 ## Result 2: statistics cannot catch a strategy that reads the future
 
-*"Buy assets trading below their long-run average price."* A plausible idea, and its natural first draft computes the average and spread over the whole series, including dates that haven't happened yet. A code review usually misses it. On 20 pure-noise markets:
+*"Buy assets trading below their long-run average price."* A plausible idea, and its natural first draft computes the average and spread over the whole series, including dates that haven't happened yet. It reads like ordinary code. On 20 pure-noise markets:
 
 | | Result |
 |---|---|
@@ -62,7 +84,10 @@ One noise market in 20 was acquitted on the open evidence, which is the 5% error
 
 Every design choice was tested on synthetic markets where the right answer is known, and the code was reviewed cold, four times. Between them, they caught all of these.
 
-- **The first version would have acquitted a cheat every time.** It had a regex and a model reviewing code for look-ahead bias. The full-sample-mean leak passes both, then sails through every statistical test (Result 2). That's why the time-travel test exists.
+<details>
+<summary>Ten mistakes, each now fixed and tested</summary>
+
+- **The first version would have acquitted a cheat every time.** It relied on a regex and a model reviewing the code for look-ahead bias. A full-sample mean gets past the regex, nothing guarantees a review catches it, and it sails through every statistical test (Result 2). That's why the time-travel test exists: it checks what the code does, not what it looks like.
 - **Then the time-travel test failed open.** A strategy that crashed on shorter history, or whose test branch was lost, counted as passing. And only three configurations per grid were tested, so a leak that switched on for one parameter value could win and walk free. Now every configuration is tested, and anything short of a complete pass counts as a failure (tested with exactly those strategies).
 - **And it could still be dodged.** The second review found three ways past it. A strategy could keep its full-sample mean in a module-level cache, so every shorter run quietly reused the future; now every run loads the strategy afresh. The earliest cut was 1% of the data, too late to see a back-filled warm-up of a few days; now there are cuts at the first two, three, five and ten days. And the cuts stopped at 80%, so code that only started cheating late, once it could see sealed dates, was never caught; now the cuts reach 95%, and the evidence room added one every 2% across the sealed period. Each of those strategies is in the test suite.
 - **And the evidence room still had gaps.** The third review showed that a cut every 2% of the history leaves gaps of several weeks. On one market, a strategy that read tomorrow's prices for about eight weeks inside one gap passed, and turned an honest REFUTED into CONFIRMED. The room now cuts at every sealed day. The same review found a strategy could still stash the future in another module or read it from the data file beside it, and that a trial failing halfway through left nothing on the record. Now shorter histories run before longer ones, no strategy code ever runs where the data file is, code that reaches outside its prices goes back for repair and is kept out of the evidence room, and a trial that fails is recorded as a mistrial. All tested.
@@ -72,6 +97,8 @@ Every design choice was tested on synthetic markets where the right answer is kn
 - **The analytic Deflated Sharpe Ratio penalised pressing the button twice.** It counts configurations, so lookback 60 and lookback 61 count as separate discoveries, and re-running the identical grid looked like more fishing. The verdict uses a stationary block bootstrap Reality Check instead, which handles correlated configurations, fat tails and volatility clustering directly, and repeats of a configuration are counted once: running the same grid three times leaves every statistic unchanged (tested).
 - **PBO convicted a genuine edge.** The Probability of Backtest Overfitting convicted a strategy whose in-sample winner made money out of sample in 99.6% of splits, because when every configuration is genuinely profitable, which one wins in-sample is random. The verdict now asks whether the in-sample winner *loses money* out of sample. PBO is still reported, as "do the exact parameters matter".
 - **"P(real)" wasn't the probability the edge is real.** It was one minus a p-value, which is a different thing. The court now reports the p-value and says what it means.
+
+</details>
 
 ## Honest limits
 
@@ -85,12 +112,12 @@ Every design choice was tested on synthetic markets where the right answer is kn
 ## How a trial works
 
 1. **Planner (Nemotron 3 Ultra)** turns the idea into a hypothesis, a parameter grid and prior-art queries. The spec is validated (at least two configurations, numeric values, valid parameter names) and returned once with the exact problem if it's malformed.
-2. **Clerk (Tavily + Nemotron 3 Nano)** searches for published versions of the effect and triages them. Only citations the search actually returned are kept, and a failed search never stops a trial.
+2. **Clerk (Tavily + Nemotron 3 Nano)** searches papers and practitioner research for the effect and triages what comes back (see [Prior art with Tavily](#prior-art-with-tavily)). It can only cite what the search returned, and a failed search never stops a trial.
 3. **Engineer (Nemotron 3 Super)** writes `positions(prices, **params)`.
 4. **Token Factory Sandboxes** run the grid on the open evidence only, one branch per chunk of the grid, and every configuration is time-travel tested inside its branch. The harness applies the one-day lag and costs itself, so generated code cannot trade on the close it just saw. No strategy code runs where the data file is: the checkpoint only checks the code is valid Python, and each branch deletes the file before loading the strategy. A branch lost to a network error is retried once; if it is lost again, the trial is a mistrial rather than the code's fault.
-5. **Repair loop:** crashes, parameters that change nothing, time-travel failures and code that reaches outside its prices go back to Nemotron Super with the error or the dates, up to twice. If a repair breaks code that used to run, the last version that ran is judged. Code that still reads the future, or still can't be verified, is convicted; code that never runs at all is a mistrial. Either way the configurations tried go on the record.
+5. **Repair loop:** crashes, parameters that change nothing, time-travel failures and code that reaches outside its prices go back to Nemotron Super with the error or the dates, up to twice; if the problem survives Super's repair, the second goes to Nemotron Ultra. If a repair breaks code that used to run, the last version that ran is judged. Code that still reads the future, or still can't be verified, is convicted; code that never runs at all is a mistrial. Either way the configurations tried go on the record.
 6. **Auditor (static rules + Nemotron 3 Nano)** reviews the code judged. An answer it can't read counts as medium risk, not low. Code that still reaches outside the prices it is given (imports beyond numpy and pandas, files, Python internals, changes to shared modules) is high risk, and the evidence room stays shut for it.
-7. **Statistics:** the Reality Check p-value over the whole court record, RMT distinct bets, CSCV (how often the in-sample winner loses out of sample), walk-forward selection, and "years of live trading to prove it": how long a live record at the walk-forward Sharpe would take to show the Sharpe is above zero.
+7. **Statistics:** the Reality Check p-value over the whole court record, so every earlier trial raises the bar; the independent directions (random matrix theory) and luck's real number of tries; the literature's own configuration, if Tavily found one, tested on its own; and, on this trial's own configurations, CSCV (how often the in-sample winner loses out of sample), walk-forward selection, and "years of live trading to prove it": how long a live record at the walk-forward Sharpe would take to show the Sharpe is above zero.
 8. **Judge (Nemotron 3 Ultra)** explains the ruling and is told to use only numbers in the evidence. A headline that contradicts the verdict is replaced with the court's own, and if the reply can't be read the court writes its own opinion. Either way the record says so.
 9. **Evidence room:** commit (recorded first, with the count of earlier openings), then one test on sealed data in a fresh sandbox, time-travel tested at every sealed day.
 10. **Court record:** a self-contained HTML page with the verdict, the numbers, the time-travel result and the commitment hash, to attach to a write-up or application.
@@ -119,28 +146,40 @@ Isolation usually means "the agent can't break my machine". Here it also means "
 
 ## Model routing, built for live models
 
-| Role | Tier | Why this tier |
-|---|---|---|
-| Planner | Nemotron 3 Ultra | Turning a vague idea into a falsifiable spec needs real reasoning |
-| Engineer | Nemotron 3 Super | Strong code generation, and repair from a precise error, at a fraction of Ultra's price |
-| Fisherman | Nemotron 3 Super | Decides where to fish next from the history of attempts |
-| Auditor | Nemotron 3 Nano | Short focused review of the code judged |
-| Clerk | Nemotron 3 Nano | Classifying search snippets is cheap work |
-| Judge | Nemotron 3 Ultra | Must explain statistics faithfully without inventing numbers |
+| Role | Tier | Thinks first | Why this tier |
+|---|---|---|---|
+| Planner | Nemotron 3 Ultra | yes | Turning a vague idea into a falsifiable spec needs real reasoning |
+| Engineer | Nemotron 3 Super | yes | Strong code generation, and repair from a precise error, at a fraction of Ultra's price |
+| Engineer, last repair | Nemotron 3 Ultra | yes | Only when a leak or crash survived Super's repair: the hard cases get the strongest tier |
+| Fisherman | Nemotron 3 Super | yes | Decides where to fish next from the history of attempts |
+| Auditor | Nemotron 3 Nano | no | Short focused review of the code judged |
+| Clerk | Nemotron 3 Nano | no | Reading numbered search results and citing by number is quick work |
+| Judge | Nemotron 3 Ultra | yes | Must explain statistics faithfully without inventing numbers |
 
-Every request, including retries and failures, is logged with tokens, latency and cost. The client expects real models to misbehave: if a request in JSON mode is rejected and works without it, the client asks for JSON in the prompt from then on; if a reasoning model spends its budget thinking it retries with more room; reasoning tags are stripped; and an unparseable reply is re-asked once. Every reply is checked before use, and if the Nemotron fisherman proposes something unusable, the scripted fisherman takes that turn and the attempt says so. A test runs a whole trial through a fake Token Factory that answers like a real model: reasoning tags, prose around the code, a sloppy parameter grid and a leaky first draft.
+Nemotron 3 models think before they answer unless told not to, so each role says whether it should (the chat template's `enable_thinking` switch). Thinking roles get large token budgets and sample as NVIDIA's own Nemotron examples do (temperature 0.6, top_p 0.95); the auditor and clerk answer straight away, at a low temperature, which keeps the cheap calls cheap.
 
-## Quickstart
+Every request, including retries and failures, is logged with tokens, latency and cost. The client expects real models to misbehave. A configured model id that differs from the account's only in case or prefix is matched to the listed one. If a request is rejected, it is retried without each optional part in turn (JSON mode, the thinking switch), and only the part whose removal fixed it is dropped for that model from then on; JSON mode gives way to asking for JSON in the prompt. If a reasoning model spends its budget thinking, or its answer is cut off, it is asked again with four times the room. Reasoning tags are stripped, and an unparseable reply is re-asked once. Every reply is checked before use, and if the Nemotron fisherman proposes something unusable, the scripted fisherman takes that turn and the attempt says so. A test runs a whole trial through a fake Token Factory that answers like a real model: reasoning tags, prose around the code, a sloppy parameter grid and a leaky first draft.
+
+Which tier should audit and which should repair is an empirical question, so `python -m examples.tier_experiment` asks it: with a live key, Nano, Super and Ultra each review and repair the eight leaks the time-travel test is tested against, and each review of the honest library strategies counts any false alarm.
+
+## Prior art with Tavily
+
+If an effect is already in the literature, it has probably been traded away; if a paper states its parameters, those parameters were chosen before your data existed. The court uses Tavily for both.
+
+- **Two searches per query, in parallel.** The planner writes up to three queries. Each is searched in the academic record (SSRN, NBER, arXiv, journal publishers) and in practitioner research (Quantpedia, Alpha Architect, AQR and others), at advanced depth. Results are merged, duplicates dropped (the best-scoring copy kept) and ranked by Tavily's relevance score.
+- **Cited by number.** The clerk (Nemotron 3 Nano) reads the results numbered and cites them by number, so it can only point at what the search found. If its triage fails, the record still lists the top results.
+- **The literature as a pre-registration.** If the sources state values for the plan's parameters (a 12-month lookback, say), the court tests that configuration on its own. Tested alone, a configuration fixed in advance needs no correction for the search around it, so it is the one clean single test in a trial. It is reported beside the verdict, never in it: on real data the paper's own sample may overlap yours.
+- **Context, not evidence.** Prior art never changes a verdict. Every search is logged with its latency and credits, and a failed search is reported while the trial goes on.
+
+## Running it live
 
 ```bash
-git clone https://github.com/ekjots1ngh/overfit-court && cd overfit-court
-pip install -r requirements.txt
 cp .env.example .env                 # NEBIUS_API_KEY, NEBIUS_PROJECT_ID, TAVILY_API_KEY
-python -m overfit_court.preflight    # checks models, JSON mode, sandboxes and Tavily end to end
+python -m overfit_court.preflight    # checks models, thinking, JSON, sandboxes and Tavily end to end
 streamlit run app.py
 ```
 
-Without keys the app runs in demo mode: model replies are canned and ideas are routed to a built-in strategy library, but the harness, time-travel test, statistics and evidence room are all real. With a key, backtests run in Token Factory Sandboxes by default, because model-written code then runs; `OC_EXECUTOR=local` runs them in subprocesses for development.
+The pre-flight check asks each tier the way the court does, reports anything a model refused, runs a real sandbox job against a local one, and ends with what to do next. With a key, backtests run in Token Factory Sandboxes by default, because model-written code then runs; `OC_EXECUTOR=local` runs them in subprocesses for development.
 
 Real data: `pip install yfinance && python -m examples.fetch_prices sectors` writes `sectors.csv` (11 US sector ETFs), which the app and the command line accept:
 
@@ -157,11 +196,11 @@ Deploy: the `Dockerfile` serves the app on port 8501 (for example on Nebius Serv
 
 ```bash
 pip install -r requirements-dev.txt
-pytest -q            # 134 tests, all offline, about six minutes
+pytest -q            # 144 tests, all offline, about six minutes
 ruff check . && ruff format --check .
 ```
 
-Every test runs offline: two small fakes stand in for Token Factory (`tests/fake_token_factory.py`, which can misbehave on purpose: rejecting JSON mode, running out of tokens mid-thought, wrapping JSON in prose) and for Token Factory Sandboxes (`tests/fake_contree.py`, which really executes each branch, so checkpoint-and-branch behaviour is tested for real). The suite covers the statistics on known truth, the time-travel test against eight kinds of leak, strategies that crash on short history or answer differently on the same data, a leak that only some parameter values switch on, cheats that start only on sealed dates or last only a few weeks, a future stashed in another module, strategies that try to read the data file or reach outside their prices, lost, retried and timed-out sandbox branches, an evidence room shared across branches, mistrials, and every configuration of every honest strategy; sealed-evidence isolation and commitments; the court's memory, including a damaged record, a held lock and two runs sharing one record; the repair loop; fishing expeditions; model replies in the wrong shape; pre-flight; the court records; and the app's demo acts. GitHub Actions runs lint, format and tests on every push.
+Every test runs offline: two small fakes stand in for Token Factory (`tests/fake_token_factory.py`, which can misbehave on purpose: refusing JSON mode or the thinking switch, running out of tokens mid-thought, cutting an answer off, wrapping JSON in prose) and for Token Factory Sandboxes (`tests/fake_contree.py`, which really executes each branch, so checkpoint-and-branch behaviour is tested for real). The suite covers the statistics on known truth, the time-travel test against eight kinds of leak, strategies that crash on short history or answer differently on the same data, a leak that only some parameter values switch on, cheats that start only on sealed dates or last only a few weeks, a future stashed in another module, strategies that try to read the data file or reach outside their prices, lost, retried and timed-out sandbox branches, an evidence room shared across branches, mistrials, and every configuration of every honest strategy; sealed-evidence isolation and commitments; the court's memory, including a damaged record, a held lock and two runs sharing one record; the repair loop, including the last repair going to Ultra; fishing expeditions; model replies in the wrong shape; Tavily searches merged and ranked, citations by number and the literature's own configuration; pre-flight; the court records; and the app's demo acts. GitHub Actions runs lint, format and tests on every push.
 
 ### A short code tour
 
@@ -171,14 +210,14 @@ Start with `overfit_court/pipeline.py`: `run_trial` reads as six numbered steps,
 2. `stats.py` holds every statistical test, in the order a trial uses them, with references. `verdict_from_stats` is the whole ruling, and its docstring says why each check is there.
 3. `rmt.py` counts distinct bets; its docstring explains the noise correction.
 4. `sandbox.py` runs the harness in Token Factory Sandboxes (one branch per chunk of the grid), in local subprocesses, or in-process for trusted library code.
-5. `agents.py` holds the five model roles and their prompts; none of them decides the verdict, and every reply is checked before use.
+5. `agents.py` holds the model roles and their prompts; none of them decides the verdict, and every reply is checked before use. `llm.py` is the Token Factory client they all share.
 
 ## Nebius and NVIDIA usage
 
 - **Nebius Token Factory**: every model call, through the OpenAI-compatible API (`overfit_court/llm.py`).
 - **NVIDIA Nemotron 3 Nano, Super and Ultra**: routed by role as above.
 - **Token Factory Sandboxes** (contree-sdk): checkpointed, branched execution of model-written code, the time-travel test inside every branch, and the evidence room (`overfit_court/sandbox.py`).
-- **Tavily**: runtime prior-art search (`overfit_court/research.py`).
+- **Tavily**: prior-art search of papers and practitioner research, and the literature's own parameters tested on their own (`overfit_court/research.py`, `pipeline.literature_test`).
 
 ## Project layout
 
@@ -196,12 +235,13 @@ overfit_court/
   sandbox.py    executors: Token Factory Sandboxes, local subprocess, in-process (trusted only)
   stories.py    the three demo acts
   report.py     court records: a shareable HTML page, and Markdown for the CLI
-  research.py   Tavily prior-art search
-  preflight.py  live setup check: models, JSON mode, a real sandbox job, Tavily
+  research.py   Tavily prior-art search: papers and practice, merged and ranked
+  preflight.py  live setup check: models, thinking, JSON mode, a real sandbox job, Tavily
   config.py     settings from environment variables (see .env.example)
   data.py       synthetic markets with known truth, CSV loading
 app.py          Streamlit UI: Start here, trial, fishing expedition, how it works
-examples/       the experiments behind every number in this README, real data download
+static/fonts/   Public Sans, served with the app (SIL Open Font License)
+examples/       the experiments behind every number in this README, the tier experiment, real data
 tests/          offline tests, with fakes for Token Factory and Sandboxes
 docs/           feedback on the Nebius and NVIDIA tools
 ```

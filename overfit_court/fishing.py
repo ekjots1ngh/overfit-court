@@ -22,7 +22,6 @@ from dataclasses import asdict, dataclass, field
 
 import numpy as np
 import pandas as pd
-from scipy import stats as st
 
 from . import stats
 from .config import Settings, get_settings
@@ -159,7 +158,13 @@ class NemotronFisherman:
         user = "Previous attempts:\n" + ("\n".join(past) if past else "none yet")
         try:
             reply = self.llm.chat_json(
-                "fisherman", "super", system, user, mock=lambda: "{}", max_tokens=1500
+                "fisherman",
+                "super",
+                system,
+                user,
+                mock=lambda: "{}",
+                reasoning=True,
+                max_tokens=6000,
             )
         except Exception:  # no usable reply: the scripted fisherman takes this turn
             reply = {}
@@ -245,10 +250,13 @@ class Expedition:
             "claimed": f"{self.claimed_family} {self.claimed_params}",
             "claimed_sharpe_annual": round(self.claimed_sharpe_annual, 2),
             "naive_p_value": round(self.naive_p_value, 4),
+            # The textbook correction: the claim's own p-value times every branch walked.
+            "bonferroni_p_value": round(min(1.0, self.naive_p_value * self.n_configs), 4),
             "claim_grid_p_value": round(self.claim_grid_p_value, 4),
             "court_verdict": self.court.verdict,
             "court_p_value": round(self.court.reality_check.p_value, 4),
             "luck_sharpe_annual": round(self.court.reality_check.null_median_annual, 2),
+            "luck_equivalent_tries": self.court.luck_equivalent_tries,
             "configs": self.n_configs,
             "distinct_bets": round(self.distinct_bets, 1),
             "sealed": None if sealed is None else sealed.verdict,
@@ -368,9 +376,7 @@ def run_expedition(
     r = everything[claim].to_numpy()
 
     # Judge 1: the claimed strategy tested as if it were the only one ever tried.
-    naive = 1.0 - stats.probabilistic_sharpe_ratio(
-        claim_sharpe, 0.0, len(r), float(st.skew(r)), float(st.kurtosis(r, fisher=False))
-    )
+    naive = stats.single_test_p_value(r)
     # Judge 2: a Reality Check over only the grid the claim came from (selective reporting).
     claim_grid = next(res for res in results if claim in res.columns)
     reported = stats.reality_check(

@@ -102,6 +102,18 @@ def probabilistic_sharpe_ratio(
     return float(st.norm.cdf(z))
 
 
+def single_test_p_value(returns) -> float:
+    """One-sided p-value that the true Sharpe is zero or less, for ONE strategy fixed in advance.
+
+    Only valid when nothing was chosen by looking at this data. A strategy
+    picked as the best of many needs the Reality Check instead.
+    """
+    r = np.asarray(returns, dtype=float)
+    skew = float(st.skew(r)) if r.size > 2 else 0.0
+    kurt = float(st.kurtosis(r, fisher=False)) if r.size > 3 else 3.0
+    return 1.0 - probabilistic_sharpe_ratio(sharpe(r), 0.0, r.size, skew, kurt)
+
+
 def expected_max_sharpe(var_sr: float, n_trials: int) -> float:
     """Expected best Sharpe among `n_trials` independent strategies with no skill.
 
@@ -114,12 +126,39 @@ def expected_max_sharpe(var_sr: float, n_trials: int) -> float:
     return float(math.sqrt(var_sr) * ((1.0 - EULER_GAMMA) * a + EULER_GAMMA * b))
 
 
+def luck_equivalent_tries(luck_sharpe: float, n_days: int, limit: int = 10**8) -> int:
+    """How many independent, skill-free strategies would give luck the same best Sharpe.
+
+    The Reality Check's luck bar is the best Sharpe (per day) that zero-edge
+    versions of everything tried typically reach. Independent strategies with
+    no skill have Sharpes spread with variance about 1 / n_days, so this finds
+    the smallest number of them whose expected best is as high. Correlated
+    configurations make it smaller than the raw count, but it is the count that
+    says how many chances luck really had; the distinct-bets count from random
+    matrix theory (rmt.py) says how many directions the configurations move in,
+    which is a different and smaller number.
+    """
+    if luck_sharpe <= 0 or n_days < 2:
+        return 1
+    variance = 1.0 / n_days
+    low, high = 1, 2
+    while expected_max_sharpe(variance, high) < luck_sharpe and high < limit:
+        low, high = high, high * 2
+    while low < high:  # the smallest count whose expected best reaches the luck bar
+        middle = (low + high) // 2
+        if expected_max_sharpe(variance, middle) < luck_sharpe:
+            low = middle + 1
+        else:
+            high = middle
+    return low
+
+
 def deflated_sharpe_ratio(returns, trial_sharpes, n_trials: int | None = None) -> float:
     """Confidence that the chosen strategy's Sharpe survives the number of trials run.
 
     The analytic version from Bailey & Lopez de Prado (2014). It assumes the
-    trials are independent, so pass `n_trials` (for example the number of
-    distinct bets) when they are not. Overfit Court reports it for comparison
+    trials are independent, so pass `n_trials` (for example the luck-equivalent
+    number of tries) when they are not. Overfit Court reports it for comparison
     with the literature; the verdict uses the bootstrap Reality Check, which
     handles correlated trials directly.
     """
@@ -346,11 +385,17 @@ def verdict_reasons(p_value: float, wf_sharpe_annual: float, prob_oos_loss: floa
     """The checks that clearly failed, in plain words (empty if none did)."""
     reasons = []
     if p_value > P_VALUE_TO_CONVICT:
-        reasons.append(f"luck explains it ({fmt_p(p_value)})")
+        reasons.append(f"luck alone does as well ({fmt_p(p_value)})")
     if wf_sharpe_annual <= 0:
-        reasons.append(f"chosen walk-forward it loses money (Sharpe {wf_sharpe_annual:.2f})")
+        reasons.append(
+            f"chosen on past data and traded on the next period, it loses money "
+            f"(Sharpe {wf_sharpe_annual:.2f})"
+        )
     if prob_oos_loss >= OOS_LOSS_TO_CONVICT:
-        reasons.append(f"the in-sample winner loses out of sample in {prob_oos_loss:.0%} of splits")
+        reasons.append(
+            f"the best choice on past data loses money on unseen data in {prob_oos_loss:.0%} "
+            "of splits"
+        )
     return reasons
 
 

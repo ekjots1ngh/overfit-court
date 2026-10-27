@@ -1,6 +1,7 @@
 """Model replies are checked before anything uses them, and demo-mode routing matches words."""
 
 import json
+from unittest.mock import ANY
 
 import pytest
 from fake_token_factory import FakeTokenFactory, response
@@ -18,6 +19,7 @@ EVIDENCE = {
     "n_distinct_configs_on_this_data": 63,
     "distinct_bets_this_trial": 3.1,
     "distinct_bets_total": 3.1,
+    "luck_equivalent_tries": 12,
     "best_sharpe_annual": 0.81,
     "luck_sharpe_annual": 0.74,
     "p_value": 0.31,
@@ -60,21 +62,34 @@ def test_the_judge_cannot_contradict_the_verdict_or_return_a_string_of_reasons(s
     assert "headline" in opinion["note"]  # the record says whose headline it is
 
 
+HITS = [
+    {"kind": "papers", "title": "Returns to buying winners (1993)", "url": "https://ex.org/a"},
+    {"kind": "practice", "title": "Momentum, after costs", "url": "https://ex.org/b"},
+]
+
+
 def test_the_clerk_can_only_cite_what_the_search_found(settings):
-    hits = [
-        {"query": "q", "title": "Momentum (2013)", "url": "https://example.org/a", "content": ""}
-    ]
     reply = {
         "already_known": "yes",
         "summary": "Well known.",
-        "citations": [
-            {"title": "Made-up paper", "url": "https://example.org/invented"},
-            {"title": "Renamed by the model", "url": "https://example.org/a"},
-            "not even an object",
-        ],
+        "cite": [1, 7, "0", True, 1, -1],  # out of range, not numbers, a repeat
+        "published": {
+            "lookback": {"value": 252, "source": 0},
+            "skip": {"value": 21, "source": 9},  # a source that was never found
+            "made_up": {"value": 1, "source": 0},  # not a parameter of the plan
+        },
     }
-    found = agents.triage_prior_art(live(settings, json.dumps(reply)), {}, hits)
-    assert found["citations"] == [{"title": "Momentum (2013)", "url": "https://example.org/a"}]
+    spec = {"param_grid": {"lookback": [60, 250], "skip": [0, 21]}}
+    found = agents.triage_prior_art(live(settings, json.dumps(reply)), spec, HITS)
+    assert found["citations"] == [
+        {"title": "Momentum, after costs", "url": "https://ex.org/b", "kind": "practice"}
+    ]
+    assert found["published"] == {
+        "lookback": {
+            "value": 252,
+            "source": {"title": HITS[0]["title"], "url": "https://ex.org/a", "kind": "papers"},
+        }
+    }
     assert found["already_known"] is None  # "yes" is not a boolean
 
 
@@ -88,10 +103,42 @@ def test_a_failed_search_is_reported_and_the_trial_goes_on(settings, monkeypatch
 
     monkeypatch.setattr(research, "TavilyClient", BrokenTavily)
     settings.tavily_api_key = "test"
-    hits, note = research.prior_art(["momentum anomaly"], settings)
-    assert hits == [] and "tavily is down" in note
-    found = agents.triage_prior_art(LLM(settings), {}, hits, note)
+    search = research.prior_art(["momentum anomaly"], settings)
+    assert search.hits == [] and "tavily is down" in search.note
+    assert search.usage()["searches"] == search.usage()["failed"] == 2  # papers and practice
+    found = agents.triage_prior_art(LLM(settings), {}, search.hits, search.note)
     assert found["already_known"] is None and "tavily is down" in found["summary"]
+
+
+def test_papers_and_practice_are_searched_merged_and_ranked(settings, monkeypatch):
+    class FakeTavily:
+        calls = []
+
+        def __init__(self, api_key):
+            pass
+
+        def search(self, query, **options):
+            FakeTavily.calls.append((query, tuple(options["include_domains"])))
+            kind = "papers" if "ssrn.com" in options["include_domains"] else "practice"
+            shared = {"url": "https://ex.org/shared", "title": "Both found this", "content": ""}
+            results = [
+                {**shared, "score": 0.9 if kind == "papers" else 0.4},
+                {"url": f"https://ex.org/{kind}/{query}", "title": kind, "score": 0.5},
+                {"title": "no url", "score": 1.0},
+            ]
+            return {"results": results, "usage": {"credits": 2}}
+
+    monkeypatch.setattr(research, "TavilyClient", FakeTavily)
+    settings.tavily_api_key = "test"
+    search = research.prior_art(["q1", "q2", "q3", "q4"], settings)
+    assert len(FakeTavily.calls) == 6  # three queries at most, each in papers and in practice
+    urls = [hit["url"] for hit in search.hits]
+    assert urls[0] == "https://ex.org/shared" and urls.count("https://ex.org/shared") == 1
+    assert search.hits[0]["score"] == 0.9 and search.hits[0]["kind"] == "papers"  # best copy
+    assert [hit["score"] for hit in search.hits] == sorted(
+        (hit["score"] for hit in search.hits), reverse=True
+    )
+    assert search.usage() == {"searches": 6, "failed": 0, "credits": 12, "slowest_s": ANY}
 
 
 def test_no_reply_at_all_never_crashes_a_trial(settings):
@@ -105,15 +152,15 @@ def test_no_reply_at_all_never_crashes_a_trial(settings):
         assert opinion.pop("note").startswith("The court's own opinion")
         assert opinion == courts_own
     assert "note" not in agents.judge(LLM(settings.offline()), "CONVICTED", EVIDENCE)
-    hits = [{"query": "q", "title": "t", "url": "https://example.org/a", "content": ""}]
-    found = agents.triage_prior_art(live(settings, "no", "no"), {}, hits)
+    found = agents.triage_prior_art(live(settings, "no", "no"), {}, HITS)
     assert found["already_known"] is None and "triage failed" in found["summary"]
+    assert [hit["url"] for hit in found["top_results"]] == ["https://ex.org/a", "https://ex.org/b"]
 
 
 def test_odd_shapes_from_the_clerk_and_the_planner_are_handled(settings):
-    hits = [{"query": "q", "title": "t", "url": "https://example.org/a", "content": ""}]
-    reply = {"citations": [{"url": ["https://example.org/a"]}]}  # a URL given as a list
-    assert agents.triage_prior_art(live(settings, json.dumps(reply)), {}, hits)["citations"] == []
+    reply = {"cite": "0", "published": ["lookback", 252]}  # a string and a list, not the shapes
+    found = agents.triage_prior_art(live(settings, json.dumps(reply)), {}, HITS)
+    assert found["citations"] == [] and found["published"] == {}
     spec = json.loads(
         '{"param_grid": {"a": [1, 2, NaN, Infinity]}, "search_queries": "momentum anomaly",'
         ' "family": ["momentum"]}'

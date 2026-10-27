@@ -6,6 +6,7 @@ import pytest
 from fake_contree import FakeContree
 from fake_token_factory import FakeTokenFactory, response
 
+from examples.leaks import LEAKS, source
 from overfit_court import _harness
 from overfit_court._harness import LEAKED, PASSED, UNVERIFIED
 from overfit_court.data import synthetic_prices
@@ -24,35 +25,12 @@ from overfit_court.pipeline import (
 from overfit_court.sandbox import InProcessExecutor, LocalExecutor, NebiusSandboxExecutor
 from overfit_court.stats import ACQUITTED, CONFIRMED, CONVICTED, MISTRIAL, P_VALUE_TO_ACQUIT
 
-LEAKS = {
-    "full-sample mean": "z = (prices - prices.mean()) / prices.std()\n    return -np.sign(z)",
-    "negative shift": "return np.sign(prices.shift(-1) - prices).fillna(0)",
-    "back-fill": (
-        "nxt = prices.where(prices.pct_change() > 0).bfill()\n"
-        "    return np.sign(nxt - prices).fillna(0)"
-    ),
-    # Only the warm-up period leaks, so only the early cuts can see these.
-    "back-filled warm-up": "return np.sign(prices - prices.rolling(250).mean().bfill())",
-    "short back-filled warm-up": "return np.sign(prices - prices.rolling(5).mean().bfill())",
-    "centred window": "return np.sign(prices - prices.rolling(21, center=True).mean()).fillna(0)",
-    "whole-series quantile": "return (prices > prices.quantile(0.5)).astype(float)",
-    # Computes the full-sample anchor on its first call and reuses it on every later
-    # one, which would hide the leak if runs shared the module.
-    "anchor cached between calls": (
-        "if not CACHE:\n        CACHE['mean'], CACHE['sd'] = prices.mean(), prices.std()\n"
-        "    return -np.sign((prices - CACHE['mean']) / CACHE['sd'])"
-    ),
-}
 LEAKY_IDEA = "buy assets trading below their long-run average price"
 
 
 def strategy(body: str):
     """A loader for a strategy whose positions(prices) function has this body."""
-    source = (
-        "import numpy as np\nimport pandas as pd\n\nCACHE = {}\n\n"
-        f"def positions(prices):\n    {body}\n"
-    )
-    return _harness.strategy_loader(source)
+    return _harness.strategy_loader(source(body))
 
 
 def check(load_strategy, prices, grid=None, extra_cuts=()):

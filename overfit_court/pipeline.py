@@ -130,7 +130,8 @@ class Findings:
     reality_check_this_trial: stats.RealityCheckResult  # over this trial's configurations alone
     spectrum: rmt.Spectrum  # distinct bets in the whole court record
     spectrum_this_trial: rmt.Spectrum
-    deflated_sharpe: float  # analytic DSR with distinct bets as trials (for reference)
+    luck_equivalent_tries: int  # independent tries that would give luck the same best Sharpe
+    deflated_sharpe: float  # analytic DSR with luck-equivalent tries as trials (for reference)
     cscv: stats.CSCVResult
     walk_forward: stats.WalkForwardResult
     years_to_prove_live: float | None  # track record needed at the walk-forward Sharpe
@@ -157,11 +158,12 @@ def judge_statistics(
     """Judge the best configuration in `returns`, remembering everything in `prior`.
 
     The Reality Check asks whether the pick beats the best that luck would
-    produce across EVERY configuration ever tried on this data. CSCV and
-    walk-forward also run over the whole record: they judge the research
-    process ("pick the best of everything tried"), not just the last grid.
-    Exact repeats of a configuration are counted once: running the same grid
-    twice is not more research.
+    produce across EVERY configuration ever tried on this data, so earlier
+    trials raise the bar. CSCV, walk-forward and "years to prove it" judge how
+    this trial's own pick holds up out of sample, so they use this trial's
+    configurations only: another trial's strategy (perhaps one that cheated)
+    must never stand in for this one. Exact repeats of a configuration are
+    counted once: running the same grid twice is not more research.
     """
     sharpes = returns.apply(stats.sharpe)
     best = str(sharpes.idxmax())
@@ -179,13 +181,12 @@ def judge_statistics(
     else:
         reality_this, spectrum_this = reality, spectrum
 
+    luck_tries = stats.luck_equivalent_tries(reality.null_median, len(returns))
     every_sharpe = [stats.sharpe(everything[:, j]) for j in range(everything.shape[1])]
-    deflated = stats.deflated_sharpe_ratio(
-        returns[best], every_sharpe, n_trials=max(2, round(spectrum.distinct_bets))
-    )
-    splits = _CSCV_SPLITS if everything.shape[1] <= _MANY_CONFIGS else _CSCV_SPLITS_MANY
-    cscv = stats.pbo_cscv(everything, n_splits=splits)
-    walk = stats.walk_forward(everything)
+    deflated = stats.deflated_sharpe_ratio(returns[best], every_sharpe, n_trials=luck_tries)
+    splits = _CSCV_SPLITS if this_trial.shape[1] <= _MANY_CONFIGS else _CSCV_SPLITS_MANY
+    cscv = stats.pbo_cscv(this_trial, n_splits=splits)
+    walk = stats.walk_forward(this_trial)
     # A committed strategy trading live faces no selection. So: at the Sharpe that
     # walk-forward selection actually earned, how long a live record would it take
     # to show the true Sharpe is above zero?
@@ -203,6 +204,7 @@ def judge_statistics(
         reality_check_this_trial=reality_this,
         spectrum=spectrum,
         spectrum_this_trial=spectrum_this,
+        luck_equivalent_tries=luck_tries,
         deflated_sharpe=deflated,
         cscv=cscv,
         walk_forward=walk,
@@ -332,6 +334,7 @@ class Trial:
             "n_distinct_configs_on_this_data": f.reality_check.n_configs,
             "distinct_bets_this_trial": round(f.spectrum_this_trial.distinct_bets, 1),
             "distinct_bets_total": round(f.spectrum.distinct_bets, 1),
+            "luck_equivalent_tries": f.luck_equivalent_tries,
             "n_days_open": int(self.returns.shape[0]),
             "sealed_from": None if self.cut is None else str(self.cut.date()),
             "best_params": f.best_params,
@@ -434,6 +437,12 @@ def run_trial(
     open_prices, cut = split_sealed(prices_full, sealed_fraction)
     timings: dict = {}
 
+    if llm.mock:
+        log(
+            "Demo mode: no NEBIUS_API_KEY is set, so the model replies below are canned and the "
+            "idea is matched to a built-in strategy. The backtests and statistics are real."
+        )
+
     # 1. plan
     with _timed(timings, "plan_s"):
         if spec is None:
@@ -446,8 +455,9 @@ def run_trial(
     # 2. research
     log("Searching for prior art (Tavily) and triaging it (Nemotron Nano)...")
     with _timed(timings, "prior_art_s"):
-        hits, search_note = prior_art(spec["search_queries"], settings)
-        found = agents.triage_prior_art(llm, spec, hits, search_note)
+        search = prior_art(spec["search_queries"], settings)
+        found = agents.triage_prior_art(llm, spec, search.hits, search.note)
+        found["search"] = search.usage()
 
     # From the first backtest on, the trial goes on the court record whatever
     # happens: configurations that ran were research on this data, even if the
@@ -491,6 +501,9 @@ def run_trial(
                 seed=record_seed(key),
                 n_boot=n_boot,
             )
+        found["literature_test"] = literature_test(
+            found.get("published"), result.grid, result.returns
+        )
         history = ledger.history(key)
         data_source = describe_data(prices_full)
         if prices is None:
@@ -521,7 +534,7 @@ def run_trial(
             code_history=attempts,
             ledger=ledger,
             prices_full=prices_full,
-            execution={**result.summary(), "setup": result.setup},
+            execution={**result.summary(), "setup": result.setup, "per_branch": result.metrics},
             timings=timings,
             data_source=data_source,
             executor=executor.name,
@@ -540,6 +553,48 @@ def run_trial(
     return trial
 
 
+def literature_test(published: dict | None, grid: dict, returns: pd.DataFrame) -> dict | None:
+    """The configuration the literature names, tested on its own.
+
+    Parameter values a paper published before this data was seen are a
+    pre-registration: that one configuration, tested alone, needs no correction
+    for the search around it. Each published value is matched to the nearest
+    value in the grid, and then the nearest configuration that ran is used
+    (`exact` says whether it is the published one). It needs a published value
+    for every parameter. On real data the papers' own sample may overlap this
+    one, so the test is only fully clean on later dates, as the README says.
+    """
+    names = {name for params in grid.values() for name in params}
+    if not published or not names or set(published) != names:
+        return None
+    values = {name: sorted({params[name] for params in grid.values()}) for name in names}
+
+    def nearest(name: str) -> int:  # position of the grid value closest to the published one
+        target = published[name]["value"]
+        return min(range(len(values[name])), key=lambda i: abs(values[name][i] - target))
+
+    wanted = {name: nearest(name) for name in names}
+    ran = [key for key in grid if key in returns.columns]
+    if not ran:
+        return None
+
+    def distance(key) -> int:
+        return sum(abs(values[n].index(grid[key][n]) - wanted[n]) for n in names)
+
+    key = min(ran, key=distance)
+    r = returns[key].to_numpy()
+    sources = {published[name]["source"]["url"]: published[name]["source"] for name in names}
+    return {
+        "published": {name: published[name]["value"] for name in sorted(names)},
+        "params": grid[key],
+        "exact": distance(key) == 0
+        and all(values[n][wanted[n]] == published[n]["value"] for n in names),
+        "sharpe_annual": round(stats.annualise(stats.sharpe(r)), 4),
+        "p_value": round(stats.single_test_p_value(r), 6),
+        "sources": list(sources.values()),
+    }
+
+
 def _build(
     *, llm, spec, grid, first_draft, executor, open_prices, cut, cost_bps, max_repairs, runs, log
 ) -> tuple[str, ExecutionResult, list[dict]]:
@@ -548,7 +603,9 @@ def _build(
     A crash, parameters that change nothing, a time-travel test that finds a
     leak or cannot run, or code that reaches outside the prices it is given,
     goes back to Nemotron Super with the exact problem (for a leak: the
-    parameters and dates). After `max_repairs` repairs the last attempt stands,
+    parameters and dates). If a problem is still there after a repair, the
+    last repair allowed goes to Nemotron Ultra, the tier that reasons hardest.
+    After `max_repairs` repairs the last attempt stands,
     unless a repair broke the strategy outright: then the last version that did
     run is judged, problems and all. Results the sandbox service lost are no
     fault of the code, so they end the trial as a mistrial instead of going
@@ -608,9 +665,10 @@ def _build(
         )
         if problem is None or attempt > max_repairs:
             break
-        log(f"{problem[:200]} Sending it back to Nemotron Super for repair...")
+        tier = "ultra" if 1 < attempt == max_repairs else "super"
+        log(f"{problem[:200]} Sending it back to Nemotron {tier.title()} for repair...")
         try:
-            code = agents.write_code(llm, spec, error=problem, previous=code)
+            code = agents.write_code(llm, spec, error=problem, previous=code, tier=tier)
         except Exception as e:  # no repair came back: what has been run is judged
             log(f"The repair request failed ({type(e).__name__}: {e}).")
             break

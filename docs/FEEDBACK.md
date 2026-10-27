@@ -1,6 +1,22 @@
 # Feedback on Nebius Token Factory, Sandboxes and NVIDIA tools
 
-A running log written while building. Each item says what happened, why it mattered, and a suggested fix.
+A running log written while building. Each item says what happened, why it mattered, and a suggested fix. The Sandboxes items come from building the executor against the contree-sdk 0.3.6 source and testing it against a local stand-in; the Token Factory items come from building a client for Nemotron 3 through the OpenAI-compatible API. Anything learned from live runs is marked as such.
+
+## Token Factory and Nemotron 3
+
+1. **Turning thinking off isn't an API parameter.** Nemotron 3 thinks before it answers by default. That is right for planning and writing code, and wasteful for a two-line audit or triaging search results. The switch is the chat template's `enable_thinking`, which the OpenAI SDK has no field for, so it has to go in `extra_body={"chat_template_kwargs": {...}}`, and whether a given model accepts it is found out by trying. The client sends it, and if the request is rejected, retries without it and remembers. *Suggestion:* accept the OpenAI-style `reasoning_effort` (or a documented `thinking` flag) on every reasoning model and map it to the template, and say on each model card whether it is supported.
+
+2. **Thinking spends the answer's budget.** With thinking on, a `max_tokens` that would be generous for the answer alone can run out mid-thought: the reply is empty and `finish_reason` is `length`. A careful client retries with more room; a quick script just sees nothing. *Suggestion:* recommended budgets per model on the model card, or a separate limit for reasoning tokens, so the answer's budget can't be eaten.
+
+3. **Capabilities are discovered by trial and error.** JSON mode is supported by some models and not others (the catalogue's "JSON mode" tag), and an unsupported request is rejected rather than ignored. Combined with item 1, a rejected request has two possible causes, so the client retries without each optional part in turn to learn which one the model refused. *Suggestion:* list each model's capabilities (JSON mode, JSON schema, the thinking switch, context length) in the `/v1/models` response, so a client can decide before sending.
+
+4. **Model ids are long and change between releases.** Ids such as `nvidia/nemotron-3-super-120b-a12b` are easy to get slightly wrong in an `.env` file, and differ in case or prefix between places they are written. The client matches the configured id against the account's model list, and the pre-flight check lists the Nemotron ids the account can use. *Suggestion:* stable aliases (`nemotron-3-super-latest`), and an error for an unknown model that suggests the nearest id.
+
+5. **Sampling advice lives in the model cards.** NVIDIA's examples for Nemotron 3 in reasoning mode use temperature 0.6 and top_p 0.95; a client that keeps the usual low temperature for "deterministic" tasks gets worse reasoning. *Suggestion:* show the recommended sampling settings next to each model in the Token Factory catalogue and playground.
+
+6. **Spend has to be computed client-side.** Responses report tokens, not cost, so per-trial cost accounting needs per-model prices copied into configuration by hand (`PRICE_*` in `.env.example`). *Suggestion:* return the cost of each request in `usage`, or prices in the model list.
+
+7. **What went well:** one OpenAI-compatible endpoint for all three tiers made role-based routing trivial: the planner, engineer, auditor, clerk and judge are the same client with a different model id and thinking setting, so moving a role between Nano, Super and Ultra is a one-word change and `examples/tier_experiment.py` can compare them directly.
 
 ## Token Factory Sandboxes and contree-sdk
 
@@ -16,4 +32,4 @@ A running log written while building. Each item says what happened, why it matte
 
 6. **Pinning the environment is up to you.** A sandbox built from `python:3.12-slim` with a bare `pip install numpy pandas` gets whatever versions are current that day, so the same job can give different numbers in a sandbox and on the machine that launched it. I now install the launching machine's exact versions and cache the image per version set. *Suggestion:* a documented pattern (or a helper) for building an image from a requirements file and reusing it by content hash.
 
-7. **What went well:** the checkpoint-and-branch model is exactly right for experiment grids. Setup runs once, every branch is isolated, and each result reports its own compute time and cost, which made per-trial cost accounting straightforward. It also enabled something I haven't seen pitched before: using isolation as a scientific guarantee (the research checkpoint physically doesn't contain the held-out data).
+7. **What went well:** the checkpoint-and-branch model is exactly right for experiment grids. Setup runs once, every branch is isolated, and each result carries its own compute time and cost, so per-trial cost accounting is a few lines of code. It also enabled something I haven't seen pitched before: using isolation as a scientific guarantee (the research checkpoint physically doesn't contain the held-out data).

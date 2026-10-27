@@ -17,16 +17,31 @@ def test_with_no_keys_everything_is_skipped(capsys):
     assert "[FAIL]" not in out
 
 
-def test_models_calls_and_json_mode(settings, capsys):
+def test_models_calls_and_refused_request_parts(settings, capsys):
     settings.nebius_api_key = "test"
     models = list(settings.models.values())
-    replies = [response("ready")] * 3 + [response('{"ok": true}'), bad_request(), response("{}")]
-    llm = LLM(settings, client=FakeTokenFactory(replies, models=models))
+
+    def token_factory(request):  # Super refuses JSON mode; the others accept everything
+        if request["model"] == settings.models["super"] and "response_format" in request:
+            return bad_request()
+        return response('{"ready": true}')
+
+    llm = LLM(settings, client=FakeTokenFactory(token_factory, models=models))
     assert preflight.check_models(settings, llm)
-    preflight.check_calls(settings, llm)
+    preflight.check_calls(llm)
     out = capsys.readouterr().out
-    assert out.count("[PASS]") == 1 + 3 + 3 + 2  # key, three ids, three calls, two JSON modes
-    assert "super rejects JSON mode" in out
+    assert out.count("[PASS]") == 1 + 3 + 3  # key, three ids, three calls
+    assert "[SKIP] super refused JSON mode" in out and "[FAIL]" not in out
+    assert "nano call, thinking off" in out and "ultra call, thinking on" in out
+
+
+def test_closing_advice(monkeypatch, capsys):
+    preflight.main()
+    assert "Ready. Next: streamlit run app.py" in capsys.readouterr().out
+    monkeypatch.setattr(preflight, "check_tavily", lambda s: preflight.report("FAIL", "Tavily"))
+    monkeypatch.setenv("TAVILY_API_KEY", "test")
+    preflight.main()
+    assert "1 check(s) failed" in capsys.readouterr().out
 
 
 def test_a_missing_model_id_names_the_ones_available(settings, capsys):

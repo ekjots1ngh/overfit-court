@@ -24,9 +24,12 @@ def test_the_start_here_tab_runs_all_three_acts():
         app.button(key=key).click().run()
         assert not app.exception, key
     text = " ".join(block.value for block in app.markdown)
-    assert "Statistics alone: ACQUITTED" in text
-    assert "With the time-travel test: CONVICTED" in text
-    assert "Sealed evidence: CONFIRMED" in text
+    assert "class='bench'" in text  # act 1's four judges
+    # Act 2: statistics alone acquit the leaky draft (stamped as fooled); the court convicts.
+    assert "<h4>Statistics alone</h4>" in text and ">ACQUITTED</span>" in text
+    assert ">Fooled</span>" in text
+    assert "<h4>With the time-travel test</h4>" in text and ">CONVICTED</span>" in text
+    assert "Sealed evidence: CONFIRMED" in text  # act 3
     assert any(b.label == "Download the court record" for b in app.get("download_button"))
 
 

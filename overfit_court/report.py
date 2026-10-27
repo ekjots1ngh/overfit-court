@@ -22,13 +22,13 @@ from .stats import (
     fmt_years,
 )
 
-VERDICT_COLOURS = {
-    CONVICTED: "#b91c1c",
-    HUNG_JURY: "#b45309",
-    ACQUITTED: "#15803d",
-    REFUTED: "#b91c1c",
-    INCONCLUSIVE: "#b45309",
-    CONFIRMED: "#15803d",
+VERDICT_COLOURS = {  # the app's stamp colours
+    CONVICTED: "#b42318",
+    HUNG_JURY: "#9a6700",
+    ACQUITTED: "#1f5940",
+    REFUTED: "#b42318",
+    INCONCLUSIVE: "#9a6700",
+    CONFIRMED: "#1f5940",
 }
 
 
@@ -64,6 +64,32 @@ def _summary_rows(trial) -> list[tuple[str, str]]:
         ("Best parameters", str(e["best_params"])),
         ("Strategy code (SHA-256)", hashlib.sha256(trial.code.encode()).hexdigest()),
     ]
+
+
+def literature_sentence(test: dict) -> str:
+    """The literature's own configuration, tested on its own, in one sentence."""
+    named = ", ".join(f"{k} {v}" for k, v in test["published"].items())
+    tested = "" if test["exact"] else f" (nearest tested: {test['params']})"
+    return (
+        f"The configuration the sources name ({named}){tested}: Sharpe "
+        f"{test['sharpe_annual']:.2f}, {fmt_p(test['p_value'])} as a single test fixed in "
+        "advance, so with no correction for the search."
+    )
+
+
+def prior_art_points(prior_art: dict) -> tuple[str, list[dict], str | None]:
+    """(summary, sources to list, the literature test sentence or None), for both records."""
+    sources = prior_art.get("citations") or prior_art.get("top_results") or []
+    test = prior_art.get("literature_test")
+    searched = prior_art.get("search") or {}
+    summary = prior_art.get("summary") or ""
+    if searched.get("searches"):
+        summary += (
+            f" ({searched['searches']} Tavily searches of papers and practitioner research"
+            + (f", {searched['credits']} credits" if searched.get("credits") is not None else "")
+            + ")"
+        )
+    return summary.strip(), sources, literature_sentence(test) if test else None
 
 
 # An opening counts even when it gives no valid result, so the record says so.
@@ -106,8 +132,12 @@ def court_record_markdown(trial) -> str:
     ]
     if trial.opinion.get("note"):
         lines += ["", f"_{trial.opinion['note']}_"]
-    if trial.prior_art.get("summary"):
-        lines += ["", f"**Prior art:** {trial.prior_art['summary']}"]
+    summary, sources, literature = prior_art_points(trial.prior_art)
+    if summary:
+        lines += ["", f"**Prior art:** {summary}"]
+        lines += [f"- [{s['title']}]({s['url']})" for s in sources]
+    if literature:
+        lines += ["", literature]
     return "\n".join(lines)
 
 
@@ -156,6 +186,15 @@ def court_record_html(trial) -> str:
     reasons = "".join(f"<li>{html.escape(r)}</li>" for r in trial.opinion.get("reasoning", []))
     note = trial.opinion.get("note")  # set when the court's own opinion replaced the judge's
     note = f"<p class='sub'>{html.escape(note)}</p>" if note else ""
+    summary, sources, literature = prior_art_points(trial.prior_art)
+    links = "".join(
+        f"<li><a href='{html.escape(s['url'])}'>{html.escape(s['title'])}</a></li>"
+        for s in sources
+        if s["url"].startswith(("https://", "http://"))
+    )
+    prior = f"<h2>Prior art</h2><p>{html.escape(summary)}</p><ul>{links}</ul>" if summary else ""
+    if literature:
+        prior += f"<p>{html.escape(literature)}</p>"
     issued = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     return f"""<!doctype html>
 <html lang="en">
@@ -166,13 +205,14 @@ def court_record_html(trial) -> str:
 <style>{_STYLE}</style>
 </head>
 <body>
-<h1>⚖️ <span style="color:{colour}; letter-spacing:.04em">{html.escape(verdict)}</span></h1>
+<h1><span style="color:{colour}; letter-spacing:.04em">{html.escape(verdict)}</span></h1>
 <p class="sub">{html.escape(trial.opinion.get("headline", ""))}</p>
 {_table(_summary_rows(trial))}
 <h2>Reasoning</h2>
 <ul>{reasons}</ul>
 {note}
 {sealed}
+{prior}
 <footer>Issued by Overfit Court on {issued}. Data fingerprint
 {html.escape(trial.record["dataset"])}, trial {e["trial_number_on_this_data"]} on this data.
 The verdict is decided by the statistics; the language model only explains it.</footer>

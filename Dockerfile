@@ -9,6 +9,8 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY overfit_court ./overfit_court
+COPY .streamlit ./.streamlit
+COPY static ./static
 COPY app.py .
 
 EXPOSE 8501

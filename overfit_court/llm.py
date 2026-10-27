@@ -4,14 +4,23 @@ Token Factory exposes an OpenAI-compatible API, so this uses the openai SDK
 pointed at a different base URL. Without NEBIUS_API_KEY it runs in demo mode,
 so the whole pipeline can be developed, tested and demoed offline.
 
+Nemotron 3 models think before they answer unless told not to. Each role
+says whether it wants that (`reasoning`): planning, writing and repairing code,
+fishing and explaining the verdict do; auditing code and triaging search
+results don't, so they stay quick and cheap. The switch is the model's chat
+template flag, `enable_thinking`.
+
 Live models misbehave in predictable ways, and each is handled here instead
 of crashing a trial:
 
-- a request in JSON mode is rejected: retry once without response_format,
-  asking for JSON in the prompt instead. If that works, the model doesn't
-  support JSON mode, so it is never sent to that model again;
-- a reasoning model spends its whole token budget thinking and returns nothing
-  usable: retry once with four times the budget;
+- the configured model id differs from the account's only in case or prefix:
+  the id the account lists is used;
+- a request with optional parts (JSON mode, the thinking switch) is rejected:
+  retry without each in turn, then without both. The part whose removal made
+  it work is never sent to that model again; JSON mode gives way to asking for
+  JSON in the prompt;
+- a reasoning model spends its whole token budget thinking, or its answer is
+  cut off: retry once with four times the budget;
 - reasoning arrives inline as <think>...</think>, or unclosed: stripped;
 - the reply is not valid JSON: ask once more, quoting the parse error;
 - rate limits, timeouts and server errors: the SDK retries with backoff.
@@ -34,8 +43,9 @@ from .config import Settings
 
 REASONING = re.compile(r"<think>.*?</think>", re.DOTALL)
 UNFINISHED_REASONING = re.compile(r"<think>(?!.*</think>).*\Z", re.DOTALL)
-MAX_TOKENS_CAP = 16_000
+MAX_TOKENS_CAP = 32_000
 JSON_ONLY = "\n\nReply with a single JSON object and nothing else."
+JSON_MODE, REASONING_SWITCH = "JSON mode", "the thinking switch"  # optional request parts
 
 
 class LLMError(RuntimeError):
@@ -67,7 +77,8 @@ class LLM:
         self.settings = settings
         self.mock = settings.mock_llm and client is None
         self.calls: list[Call] = []
-        self._rejects_json_mode: set[str] = set()  # models that refused response_format
+        self.refused: dict[str, set[str]] = {}  # model -> optional request parts it rejected
+        self._listed: list[str] | None = None  # model ids the account can use, once fetched
         self.client = client
         if not self.mock and self.client is None:
             # The SDK itself retries rate limits, timeouts and server errors with backoff.
@@ -87,48 +98,63 @@ class LLM:
         *,
         mock: Callable[[], str],
         json_mode: bool = False,
+        reasoning: bool | None = None,
         max_tokens: int = 2048,
-        temperature: float = 0.2,
     ) -> str:
-        """Ask the `tier` model; return its answer with any reasoning stripped."""
-        model = self.settings.models[tier]
+        """Ask the `tier` model; return its answer with any reasoning stripped.
+
+        `reasoning` turns the model's thinking on or off; None leaves its default.
+        """
+        model = self.model_for(tier)
         if self.mock:
             self.calls.append(Call(role, tier, f"{model} (mock)", 0, 0, 0.0, 0.0))
             return mock()
 
-        use_json_mode = json_mode and model not in self._rejects_json_mode
-        if json_mode and not use_json_mode:
-            system += JSON_ONLY
-        messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
-        request = {"role": role, "tier": tier, "messages": messages, "temperature": temperature}
+        refused = self.refused.setdefault(model, set())
+        wanted = {}  # the optional request parts this model hasn't refused
+        if reasoning is not None and REASONING_SWITCH not in refused:
+            wanted[REASONING_SWITCH] = reasoning
+        if json_mode and JSON_MODE not in refused:
+            wanted[JSON_MODE] = True
 
-        try:
-            raw, finish_reason = self._send(
-                **request, max_tokens=max_tokens, json_mode=use_json_mode
+        def ask(parts: dict, budget: int, note: str = ""):
+            prompt = system + (JSON_ONLY if json_mode and JSON_MODE not in parts else "")
+            messages = [{"role": "system", "content": prompt}, {"role": "user", "content": user}]
+            return self._send(
+                role=role,
+                tier=tier,
+                model=model,
+                messages=messages,
+                max_tokens=budget,
+                optional=parts,
+                note=note,
             )
-        except Exception as e:
-            if not (use_json_mode and _is_bad_request(e)):
-                raise
-            # Perhaps this model doesn't accept response_format: ask in the prompt instead.
-            # If the retry fails too, the request itself was the problem, and that error
-            # is raised; only if it succeeds is the model marked as rejecting JSON mode.
-            messages[0]["content"] = system + JSON_ONLY
-            use_json_mode = False
-            raw, finish_reason = self._send(
-                **request, max_tokens=max_tokens, json_mode=False, note="retry without JSON mode"
-            )
-            self._rejects_json_mode.add(model)
+
+        # If a request is rejected, perhaps the model refuses one of its optional parts:
+        # try without each in turn, then without all. The model is marked as refusing
+        # what a retry left out only if that retry succeeds; if every retry fails, the
+        # request itself was the problem and its error is raised.
+        tries = [wanted] + [{k: v for k, v in wanted.items() if k != part} for part in wanted]
+        if len(wanted) > 1:
+            tries.append({})
+        for n, parts in enumerate(tries):
+            left_out = [part for part in wanted if part not in parts]
+            note = "retry without " + " and ".join(left_out) if left_out else ""
+            try:
+                raw, finish_reason = ask(parts, max_tokens, note)
+                break
+            except Exception as e:
+                if not (_is_bad_request(e) and n + 1 < len(tries)):
+                    raise
+        refused.update(left_out)
 
         answer = strip_reasoning(raw)
-        if not answer and max_tokens < MAX_TOKENS_CAP:
-            # Usually a reasoning model that spent the whole budget thinking.
+        if (not answer or finish_reason == "length") and max_tokens < MAX_TOKENS_CAP:
+            # Usually a reasoning model that spent the budget thinking, or an answer cut
+            # off mid-way (truncated code would only waste a repair).
             bigger = min(MAX_TOKENS_CAP, max_tokens * 4)
-            raw, finish_reason = self._send(
-                **request,
-                max_tokens=bigger,
-                json_mode=use_json_mode,
-                note=f"retry with max_tokens={bigger} ({finish_reason})",
-            )
+            note = f"retry with max_tokens={bigger} ({finish_reason})"
+            raw, finish_reason = ask(parts, bigger, note)
             answer = strip_reasoning(raw)
         if not answer:
             raise LLMError(
@@ -159,31 +185,49 @@ class LLM:
     def total_cost(self) -> float:
         return sum(call.cost_usd for call in self.calls)
 
+    def model_for(self, tier: str) -> str:
+        """The model id for a tier, as the account lists it if it differs only in case or prefix."""
+        configured = self.settings.models[tier]
+        if self.mock:
+            return configured
+        if self._listed is None:
+            try:
+                self._listed = [m.id for m in self.client.models.list().data]
+            except Exception:  # listing is only a convenience; the configured id may still work
+                self._listed = []
+        if configured in self._listed:
+            return configured
+        wanted = configured.lower().split("/")[-1]
+        matches = [listed for listed in self._listed if listed.lower().split("/")[-1] == wanted]
+        return matches[0] if matches else configured
+
     def _send(
         self,
         *,
         role: str,
         tier: str,
+        model: str,
         messages: list,
-        temperature: float,
         max_tokens: int,
-        json_mode: bool,
+        optional: dict,
         note: str = "",
     ) -> tuple[str, str | None]:
         """One request to Token Factory. Returns (raw content, finish reason) and logs the call.
 
-        A request that fails is logged too (with no tokens), then the error is raised.
+        Thinking roles sample as NVIDIA's examples for Nemotron do (temperature
+        0.6, top_p 0.95); the rest keep a low temperature for steady answers. A
+        request that fails is logged too (with no tokens), then the error is raised.
         """
-        model = self.settings.models[tier]
-        options = {"response_format": {"type": "json_object"}} if json_mode else {}
+        thinking = optional.get(REASONING_SWITCH, True)
+        options = {"temperature": 0.6, "top_p": 0.95} if thinking else {"temperature": 0.2}
+        if JSON_MODE in optional:
+            options["response_format"] = {"type": "json_object"}
+        if REASONING_SWITCH in optional:
+            options["extra_body"] = {"chat_template_kwargs": {"enable_thinking": thinking}}
         start = time.perf_counter()
         try:
             response = self.client.chat.completions.create(
-                model=model,
-                messages=messages,
-                max_tokens=max_tokens,
-                temperature=temperature,
-                **options,
+                model=model, messages=messages, max_tokens=max_tokens, **options
             )
         except Exception as e:
             failure = f"failed: {type(e).__name__}: {e}"[:300]

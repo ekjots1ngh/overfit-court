@@ -28,7 +28,7 @@ DEFAULT_LEDGER = os.getenv("OC_LEDGER_DIR", "~/.overfit_court")
 def _add_data_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--csv", help="wide CSV of daily closes (default: a synthetic market)")
     parser.add_argument("--planted", action="store_true", help="synthetic market with a real edge")
-    parser.add_argument("--seed", type=int, default=7, help="synthetic market seed")
+    parser.add_argument("--seed", type=int, default=22, help="synthetic market seed")
     parser.add_argument("--ledger", default=DEFAULT_LEDGER, help="directory for the court record")
     parser.add_argument("--forget", action="store_true", help="wipe the record for this data first")
 
@@ -45,7 +45,11 @@ def _prices_and_ledger(args):
 
 
 def trial_command(argv: list[str]) -> None:
-    parser = argparse.ArgumentParser(prog="python -m overfit_court")
+    parser = argparse.ArgumentParser(
+        prog="python -m overfit_court",
+        description="Put a trading idea on trial. To send a fisherman out instead, run "
+        "python -m overfit_court fish --help.",
+    )
     parser.add_argument("idea", help="the trading idea, in plain English")
     parser.add_argument("--unseal", action="store_true", help="then test the winner on sealed data")
     parser.add_argument("--out", default="report", help="write <out>.md and <out>.json")
@@ -71,7 +75,11 @@ def trial_command(argv: list[str]) -> None:
 
 
 def fish_command(argv: list[str]) -> None:
-    parser = argparse.ArgumentParser(prog="python -m overfit_court fish")
+    parser = argparse.ArgumentParser(
+        prog="python -m overfit_court fish",
+        description="Send a fisherman out to search for a strategy until it hits a target "
+        "Sharpe, then see what four judges make of its claim.",
+    )
     parser.add_argument("--target", type=float, default=1.0, help="Sharpe the fisherman must hit")
     parser.add_argument("--attempts", type=int, default=40, help="attempts it is allowed")
     _add_data_options(parser)

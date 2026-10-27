@@ -65,18 +65,21 @@ def main(n_markets: int, use_nemotron: bool) -> None:
     results.to_csv("fishing_results.csv", index=False)
     print(f"Fisherman: {rows[0]['fisherman']}\n")
     print(
-        "| Market | Expeditions | Median branches | Median distinct bets | Hit Sharpe >= 1 "
-        "| Standard test says real | Claim's-grid check says real | Court acquits "
+        "| Market | Expeditions | Median branches | Median independent directions "
+        "| Median luck's real tries | Hit Sharpe >= 1 | Standard test says real "
+        "| Claim's-grid check says real | Bonferroni says real | Court acquits "
         "| Sealed evidence confirms | Court and sealed evidence both say real |"
     )
-    print("|---|---|---|---|---|---|---|---|---|---|")
+    print("|---|---|---|---|---|---|---|---|---|---|---|---|")
     for label, group in results.groupby("market", sort=False):
         acquitted, confirmed = group.court_verdict == "ACQUITTED", group.sealed == "CONFIRMED"
         print(
             f"| {label} | {len(group)} | {group.configs.median():.0f} | "
-            f"{group.distinct_bets.median():.0f} | {percent(group.hit_target)} | "
+            f"{group.distinct_bets.median():.0f} | {group.luck_equivalent_tries.median():.0f} | "
+            f"{percent(group.hit_target)} | "
             f"{percent(group.naive_p_value <= P_VALUE_TO_ACQUIT)} | "
             f"{percent(group.claim_grid_p_value <= P_VALUE_TO_ACQUIT)} | "
+            f"{percent(group.bonferroni_p_value <= P_VALUE_TO_ACQUIT)} | "
             f"{percent(acquitted)} | {percent(confirmed)} | {percent(acquitted & confirmed)} |"
         )
         lucky = group[acquitted]

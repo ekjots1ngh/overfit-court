@@ -1,4 +1,53 @@
 [server]
 headless = true
+enableStaticServing = true  # serves static/, where the fonts live
+
 [browser]
 gatherUsageStats = false
+
+[client]
+toolbarMode = "minimal"  # no Deploy button, developer menu or theme switch for visitors
+
+# Ledger paper and banker's-lamp green: the court's own colours. Verdict colours
+# (stamp red, bench green, ochre) are set in app.py, where the stamps are drawn.
+[theme]
+base = "light"
+primaryColor = "#1F5940"
+backgroundColor = "#F2F4EF"
+secondaryBackgroundColor = "#E4E9E1"
+textColor = "#1F2A24"
+linkColor = "#1F5940"
+borderColor = "#C9D1C6"
+baseRadius = "small"
+showSidebarBorder = true
+font = "Public Sans, sans-serif"  # served with the app (static/fonts, SIL OFL)
+headingFontWeights = [800, 700, 700, 600, 600, 600]
+chartCategoricalColors = ["#2E4A7D", "#8C9A92", "#1F5940", "#B42318", "#9A6700"]
+
+[theme.sidebar]
+backgroundColor = "#E4E9E1"
+secondaryBackgroundColor = "#F2F4EF"
+
+[[theme.fontFaces]]
+family = "Public Sans"
+url = "app/static/fonts/public-sans-latin-400-normal.woff2"
+weight = 400
+style = "normal"
+
+[[theme.fontFaces]]
+family = "Public Sans"
+url = "app/static/fonts/public-sans-latin-600-normal.woff2"
+weight = 600
+style = "normal"
+
+[[theme.fontFaces]]
+family = "Public Sans"
+url = "app/static/fonts/public-sans-latin-700-normal.woff2"
+weight = 700
+style = "normal"
+
+[[theme.fontFaces]]
+family = "Public Sans"
+url = "app/static/fonts/public-sans-latin-800-normal.woff2"
+weight = 800
+style = "normal"

@@ -82,6 +82,48 @@ def test_json_mode_is_not_blamed_for_a_request_that_fails_anyway(live):
     assert "response_format" in fake.requests[2]  # JSON mode is still used for this model
 
 
+def test_a_refused_reasoning_switch_is_dropped_alone_and_remembered(live):
+    def token_factory(request):
+        if "extra_body" in request:
+            return bad_request("unexpected keyword chat_template_kwargs")
+        return response('{"a": 1}')
+
+    llm, fake = live(token_factory)
+    assert llm.chat_json("auditor", "nano", "s", "u", mock=no_mock, reasoning=False) == {"a": 1}
+    assert [call.note.split(":")[0] for call in llm.calls] == [
+        "failed",
+        "retry without the thinking switch",  # JSON mode was kept: it wasn't the problem
+    ]
+    assert "response_format" in fake.requests[1]
+    llm.chat_json("auditor", "nano", "s", "u", mock=no_mock, reasoning=False)
+    assert "extra_body" not in fake.requests[2] and "response_format" in fake.requests[2]
+
+
+def test_thinking_and_quick_roles_ask_differently(live):
+    llm, fake = live([response("{}"), response("{}")])
+    llm.chat_json("judge", "ultra", "s", "u", mock=no_mock, reasoning=True)
+    llm.chat_json("auditor", "nano", "s", "u", mock=no_mock, reasoning=False)
+    thinking, quick = fake.requests
+    assert thinking["extra_body"] == {"chat_template_kwargs": {"enable_thinking": True}}
+    assert (thinking["temperature"], thinking["top_p"]) == (0.6, 0.95)
+    assert quick["extra_body"] == {"chat_template_kwargs": {"enable_thinking": False}}
+    assert quick["temperature"] == 0.2 and "top_p" not in quick
+
+
+def test_an_answer_cut_off_mid_way_is_asked_for_again_with_more_room(live):
+    llm, fake = live([response("```python\ndef positions(pri", "length"), response("done")])
+    assert llm.chat("coder", "super", "s", "u", mock=no_mock, max_tokens=12000) == "done"
+    assert fake.requests[1]["max_tokens"] == 32000  # four times, up to the cap
+
+
+def test_a_model_id_that_differs_only_in_case_or_prefix_is_matched(settings):
+    settings.nebius_api_key = "test"
+    listed = "nvidia/" + settings.models["super"].split("/")[-1].upper()
+    fake = FakeTokenFactory([response("ok")], models=[listed])
+    LLM(settings, client=fake).chat("coder", "super", "s", "u", mock=no_mock)
+    assert fake.requests[0]["model"] == listed
+
+
 def test_parsing_helpers():
     assert parse_json('<think>x</think>\n```json\n{"a": [1, 2]}\n```') == {"a": [1, 2]}
     assert parse_json('Here you go: {"a": 1} hope that helps') == {"a": 1}

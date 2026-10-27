@@ -2,10 +2,12 @@
 
 import itertools
 
+import numpy as np
+import pandas as pd
 import pytest
 from fake_token_factory import FakeTokenFactory, response
 
-from overfit_court import pipeline
+from overfit_court import pipeline, stats
 from overfit_court._harness import LEAKED, PASSED, UNVERIFIED
 from overfit_court.agents import SpecError, audit, validate_spec
 from overfit_court.data import PLANTED_SIGNAL, synthetic_prices
@@ -18,7 +20,9 @@ from overfit_court.pipeline import (
     TimeTravelError,
     expand_grid,
     final_verdict,
+    judge_statistics,
     run_trial,
+    split_sealed,
     unseal,
 )
 from overfit_court.report import court_record_markdown
@@ -211,6 +215,34 @@ def test_a_trial_that_never_ran_anything_leaves_no_record(settings, silent):
     assert ledger.history(record_key(prices, 0.25)) == []
 
 
+def test_out_of_sample_checks_judge_this_trials_own_configurations():
+    """An earlier trial that read the future must never stand in for this one."""
+    open_prices, _ = split_sealed(synthetic_prices(seed=3))
+    momentum, anchor = FAMILIES["momentum"], FAMILIES["anchor"]
+
+    def returns_of(family):
+        grid = expand_grid(family.param_grid, 120)
+        return InProcessExecutor().run(family.code, open_prices, grid, 5.0, False).returns
+
+    honest, leaky = returns_of(momentum), returns_of(anchor)
+    grid = dict.fromkeys(honest.columns, {})
+    alone = judge_statistics(honest, grid, seed=1, n_boot=200)
+    after_a_cheat = judge_statistics(honest, grid, prior=[leaky.to_numpy()], seed=1, n_boot=200)
+    assert after_a_cheat.walk_forward.oos_sharpe_annual == alone.walk_forward.oos_sharpe_annual
+    assert after_a_cheat.cscv.prob_oos_loss == alone.cscv.prob_oos_loss
+    assert after_a_cheat.reality_check.n_configs > alone.reality_check.n_configs  # still counted
+
+
+def test_luck_equivalent_tries_grow_with_the_search():
+    rng = np.random.default_rng(0)
+    counts = []
+    for n in (10, 100, 1000):
+        noise = rng.normal(0, 0.01, (1500, n))
+        luck = stats.reality_check(noise, 0.0, n_boot=200, seed=1).null_median
+        counts.append(stats.luck_equivalent_tries(luck, 1500))
+    assert counts == sorted(counts) and 5 < counts[0] < 15 and 500 < counts[-1] < 1500
+
+
 def test_every_library_family_runs_and_passes_the_static_audit(settings):
     prices = synthetic_prices(n_days=400, seed=1)
     llm = LLM(settings)
@@ -250,3 +282,25 @@ def test_overrides_only_ever_make_the_verdict_stricter():
     assert final_verdict(CONVICTED, PASSED, audit_risk="low") == CONVICTED
     assert final_verdict(HUNG_JURY, PASSED, audit_risk="high") == HUNG_JURY
     assert final_verdict(ACQUITTED, PASSED, audit_risk="low") == ACQUITTED
+
+
+def test_the_literatures_own_configuration_is_tested_on_its_own():
+    combos = itertools.product([60, 120, 250], [0, 21])
+    grid = {f"k{i}": {"lookback": lb, "skip": sk} for i, (lb, sk) in enumerate(combos)}
+    returns = pd.DataFrame(
+        np.random.default_rng(0).normal(0.0005, 0.01, (1000, 6)), columns=list(grid)
+    )
+    paper = {"title": "Returns to buying winners", "url": "https://ex.org/a", "kind": "papers"}
+    published = {
+        "lookback": {"value": 252, "source": paper},  # a year of trading days
+        "skip": {"value": 21, "source": paper},
+    }
+    test = pipeline.literature_test(published, grid, returns)
+    assert test["params"] == {"lookback": 250, "skip": 21} and not test["exact"]
+    assert test["sources"] == [paper]
+    assert test["p_value"] == pytest.approx(stats.single_test_p_value(returns["k5"]), abs=1e-6)
+    # Every parameter needs a published value, or there is nothing pre-registered.
+    assert pipeline.literature_test({"lookback": published["lookback"]}, grid, returns) is None
+    # If that configuration never ran, the nearest one that did is used.
+    nearest = pipeline.literature_test(published, grid, returns.drop(columns="k5"))
+    assert nearest["params"] in ({"lookback": 120, "skip": 21}, {"lookback": 250, "skip": 0})

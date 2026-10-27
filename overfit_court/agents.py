@@ -2,9 +2,13 @@
 
     Planner   Nemotron 3 Ultra   turns an idea into a testable spec and grid
     Engineer  Nemotron 3 Super   writes the strategy, and repairs it from errors
+                                 (a problem that survives a repair goes to Ultra)
     Auditor   Nemotron 3 Nano    reviews the code judged for look-ahead bias
     Clerk     Nemotron 3 Nano    triages Tavily prior-art search results
     Judge     Nemotron 3 Ultra   explains the statistical verdict in plain English
+
+The thinking roles (planner, engineer, judge) think before they answer; the
+auditor and clerk answer straight away, which is all their tasks need.
 
 None of them decides anything that matters. The verdict comes from `stats`;
 look-ahead bias is caught by the harness's time-travel test; the judge may
@@ -39,14 +43,24 @@ def _strings(value, limit: int = 8) -> list[str]:
     return [point.strip() for point in points if point.strip()][:limit]
 
 
-def _advice(llm: LLM, role: str, tier: str, system: str, user: str, *, mock, max_tokens: int):
+# Token budgets. Roles that think first need room for the thinking as well as the
+# answer; quick roles (auditing, triage) answer straight away and need little.
+THINKING_BUDGET = {"planner": 8000, "coder": 12000, "judge": 6000}
+QUICK_BUDGET = 1500
+
+
+def _advice(llm: LLM, role: str, tier: str, system: str, user: str, *, mock, reasoning: bool):
     """(reply, None) from an advisory role, or (None, why) if no usable reply came back.
 
     Advice is not evidence: the auditor, clerk and judge never decide a verdict,
     so when their reply can't be had or read, the caller uses the court's own.
     """
+    budget = THINKING_BUDGET[role] if reasoning else QUICK_BUDGET
     try:
-        return llm.chat_json(role, tier, system, user, mock=mock, max_tokens=max_tokens), None
+        reply = llm.chat_json(
+            role, tier, system, user, mock=mock, reasoning=reasoning, max_tokens=budget
+        )
+        return reply, None
     except Exception as e:  # an unreadable or empty reply, or the API failing
         return None, f"{type(e).__name__}: {e}"[:200]
 
@@ -149,6 +163,8 @@ def plan(llm: LLM, idea: str, retries: int = 1) -> dict:
                 PLANNER_SYS,
                 user,
                 mock=lambda: json.dumps(library.spec_for(library.route(idea))),
+                reasoning=True,
+                max_tokens=THINKING_BUDGET["planner"],
             )
             return validate_spec(reply)
         except ValueError as e:  # a SpecError, or a reply that isn't JSON at all
@@ -173,7 +189,13 @@ def positions(prices: pd.DataFrame, **params) -> pd.DataFrame
   files, no globals(), getattr() or Python internals, no changes to modules."""
 
 
-def write_code(llm: LLM, spec: dict, error: str | None = None, previous: str | None = None) -> str:
+def write_code(
+    llm: LLM,
+    spec: dict,
+    error: str | None = None,
+    previous: str | None = None,
+    tier: str = "super",
+) -> str:
     """Write the strategy, or repair `previous` given the `error` it produced.
 
     `error` is either a crash or the time-travel test's description of the
@@ -189,11 +211,12 @@ def write_code(llm: LLM, spec: dict, error: str | None = None, previous: str | N
     demo_code = family.fixed_code if (error and family.fixed_code) else family.code
     reply = llm.chat(
         "coder-repair" if error else "coder",
-        "super",
+        tier,
         CODER_SYS,
         user,
         mock=lambda: f"```python\n{demo_code}```",
-        max_tokens=3000,
+        reasoning=True,
+        max_tokens=THINKING_BUDGET["coder"],
     )
     return extract_code(reply)
 
@@ -387,7 +410,7 @@ def audit(llm: LLM, code: str) -> dict:
         AUDITOR_SYS,
         code,
         mock=lambda: json.dumps({"risk": "high" if static else "low", "issues": static}),
-        max_tokens=800,
+        reasoning=False,
     )
     issues = set(static)
     if review is None:
@@ -406,38 +429,80 @@ def audit(llm: LLM, code: str) -> dict:
 
 
 # --- clerk ---
-CLERK_SYS = """You triage web search results about a trading idea. Reply JSON only:
-{"already_known": bool, "summary": str (max 2 sentences),
- "citations": [{"title": str, "url": str}] (max 3, only from the given results)}"""
+CLERK_SYS = """You triage web search results about a trading idea: has the effect
+already been published? The results are numbered. Reply JSON only:
+{"already_known": true or false, "summary": str (at most two sentences),
+ "cite": [result numbers] (at most 3, the ones that best show whether it is known),
+ "published": {"<parameter>": {"value": number, "source": result number}}}
+"published" is only for the parameters listed, in the units of their grid values
+(on daily data a 12-month lookback is about 252 days), and only for values a
+result states outright. Otherwise leave it {}. Use nothing that is not in the results."""
+
+
+def _result_number(value, n: int) -> int | None:
+    """A result number the clerk gave, if it is one (a whole number in range, not a bool)."""
+    number = _parameter_value(value)
+    if isinstance(number, int) and 0 <= number < n:
+        return number
+    return None
+
+
+def _cited(hit: dict) -> dict:
+    """A search result as cited: the search's own title and URL, never the model's."""
+    return {"title": hit.get("title") or hit["url"], "url": hit["url"], "kind": hit.get("kind")}
 
 
 def triage_prior_art(llm: LLM, spec: dict, hits: list[dict], note: str | None = None) -> dict:
-    """Is this effect already published? Summarise the Tavily hits with citations.
+    """Is this effect already published? Summarise the Tavily hits, citing them by number.
 
-    Only citations whose URL was actually in the search results are kept.
+    Citing by number means the clerk can only point at what the search found.
+    It also reports any parameter values the sources state, for the plan's own
+    parameters: the court tests that configuration on its own (see
+    pipeline.literature_test). The top results are kept either way, so the
+    record shows what was found even if the triage fails.
     """
     found = [hit for hit in hits if hit.get("url")]
+    top = [_cited(hit) for hit in found[:5]]
     if not found:
         return {"already_known": None, "summary": note or "Nothing was found.", "citations": []}
-    user = f"Idea: {spec.get('hypothesis')}\n\nResults:\n{json.dumps(found, indent=1)}"
+    grid = spec.get("param_grid") or {}
+    numbered = "\n\n".join(
+        f"[{i}] ({hit.get('kind', 'web')}) {hit.get('title', '')}\n{hit['url']}\n"
+        f"{hit.get('content', '')}"
+        for i, hit in enumerate(found)
+    )
+    user = (
+        f"Idea: {spec.get('hypothesis')}\n"
+        f"Parameters and their grid values: {json.dumps(grid)}\n\nResults:\n{numbered}"
+    )
     reply, failure = _advice(
-        llm, "clerk", "nano", CLERK_SYS, user, mock=lambda: "{}", max_tokens=800
+        llm, "clerk", "nano", CLERK_SYS, user, mock=lambda: "{}", reasoning=False
     )
     if reply is None:
-        summary = f"The prior-art triage failed ({failure})."
-        return {"already_known": None, "summary": summary, "citations": []}
-    titles = {hit["url"]: hit.get("title") or hit["url"] for hit in found}
-    cited = reply.get("citations") if isinstance(reply.get("citations"), list) else []
-    citations = [
-        {"title": titles[c["url"]], "url": c["url"]}  # the search's own title, not the model's
-        for c in cited
-        if isinstance(c, dict) and isinstance(c.get("url"), str) and c["url"] in titles
-    ]
+        summary = f"The prior-art triage failed ({failure}). The top results are listed."
+        return {"already_known": None, "summary": summary, "citations": [], "top_results": top}
+
+    cite = reply.get("cite") if isinstance(reply.get("cite"), list) else []
+    numbers = [n for n in (_result_number(c, len(found)) for c in cite) if n is not None]
+    citations = [_cited(found[n]) for n in dict.fromkeys(numbers)][:3]
+
+    published = {}
+    stated = reply.get("published") if isinstance(reply.get("published"), dict) else {}
+    for name, item in stated.items():
+        if name not in grid or not isinstance(item, dict):
+            continue
+        value = _parameter_value(item.get("value"))
+        source = _result_number(item.get("source"), len(found))
+        if value is not None and source is not None:
+            published[name] = {"value": value, "source": _cited(found[source])}
+
     known = reply.get("already_known")
     return {
         "already_known": known if isinstance(known, bool) else None,
         "summary": str(reply.get("summary") or ""),
-        "citations": citations[:3],
+        "citations": citations,
+        "published": published,
+        "top_results": top,
     }
 
 
@@ -452,7 +517,9 @@ which those zero-edge versions do at least as well as the pick: small means
 luck struggles to explain the result. It is NOT the probability that the
 strategy is real, so never describe it that way. distinct_bets_total is how
 many genuinely independent bets the configurations amount to (random matrix
-theory), which can be far fewer than the number of configurations;
+theory), which can be far fewer than the number of configurations, while
+luck_equivalent_tries is how many independent tries would give luck the same
+best Sharpe, the count that says how many chances luck really had;
 prob_oos_loss is the share of train/test splits in which the in-sample winner
 loses money out of sample; pbo is the share of those splits in which it ranks
 in the bottom half out of sample, which is only about whether the exact
@@ -492,7 +559,7 @@ def judge(llm: LLM, verdict: str, evidence: dict) -> dict:
         JUDGE_SYS,
         f"Verdict: {verdict}\nEvidence:\n{json.dumps(evidence, indent=2)}",
         mock=lambda: json.dumps(fallback),
-        max_tokens=1200,
+        reasoning=True,
     )
     if reply is None:
         return {
@@ -562,32 +629,36 @@ def court_opinion(verdict: str, e: dict) -> dict:
     if e["trial_number_on_this_data"] > 1:
         memory = (
             f" This is trial {e['trial_number_on_this_data']} on this data, and the court counts "
-            f"all {e['n_distinct_configs_on_this_data']} distinct configurations tried so far "
-            f"(about {e['distinct_bets_total']:.0f} distinct bets)."
+            f"all {e['n_distinct_configs_on_this_data']} distinct configurations tried so far."
         )
     years = e["years_of_live_trading_to_prove_it"]
     if years is None:
-        proof = "Chosen walk-forward it loses money, so no live track record would confirm it."
+        proof = (
+            "Chosen on past data and traded on the next period, it loses money, so no live "
+            "track record would confirm it."
+        )
     elif years > 100:
-        proof = "At the Sharpe it earned walk-forward, proving it live would take over a century."
+        proof = "At the Sharpe it earned on unseen data, proving it live would take over a century."
     else:
         proof = (
-            f"At the Sharpe it earned walk-forward, proving it live would take about {years} years."
+            f"At the Sharpe it earned on unseen data, proving it live would take about {years} "
+            "years."
         )
     return {
         "headline": f"{verdict}: the best backtest Sharpe of {e['best_sharpe_annual']:.2f} "
         f"against {e['luck_sharpe_annual']:.2f} from luck alone.",
         "reasoning": [
-            f"{e['n_configs']} configurations were tried here, but they amount to only about "
-            f"{e['distinct_bets_this_trial']:.0f} genuinely different bets. Zero-edge versions of "
-            f"them typically reach a best Sharpe of {e['luck_sharpe_annual']:.2f}.{memory}",
+            f"{e['n_configs']} configurations were tried here. They move in only about "
+            f"{e['distinct_bets_this_trial']:.0f} independent directions, yet luck had about as "
+            f"many chances as {e['luck_equivalent_tries']} independent tries: zero-edge versions "
+            f"typically reach a best Sharpe of {e['luck_sharpe_annual']:.2f}.{memory}",
             f"Luck alone does as well as the winner in {e['p_value']:.1%} of bootstrap "
             f"resamples (the Reality Check's {fmt_p(e['p_value'])}). {proof}",
-            f"The in-sample winner lost money out of sample in {e['prob_oos_loss']:.0%} of "
-            f"train/test splits, and chosen walk-forward its Sharpe is "
-            f"{e['walk_forward_sharpe']:.2f}. (It ranked in the bottom half out of sample in "
-            f"{e['pbo']:.0%} of splits, a measure of how much the exact parameter choice was "
-            "luck.)",
+            f"The best choice on past data lost money on unseen data in "
+            f"{e['prob_oos_loss']:.0%} of train/test splits, and chosen on past data and traded "
+            f"on the next period its Sharpe is {e['walk_forward_sharpe']:.2f}. (It ranked in the "
+            f"bottom half on unseen data in {e['pbo']:.0%} of splits, a measure of how much the "
+            "exact parameter choice was luck.)",
         ],
         "what_would_change_my_mind": [
             "Committing to one configuration and passing the sealed evidence test",

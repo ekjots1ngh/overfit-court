@@ -68,3 +68,32 @@ def test_a_full_trial_through_a_live_like_model_and_the_real_subprocess_harness(
     assert trial.verdict == CONVICTED  # pure noise: the honest version has no edge
     sealed = unseal(trial, executor=LocalExecutor(), log=silent)
     assert sealed.verdict != CONFIRMED and sealed.committed_params == trial.findings.best_params
+
+
+def test_a_leak_that_survives_a_repair_goes_to_ultra_for_the_last_one(settings, silent):
+    settings.nebius_api_key = "test"
+    anchor = FAMILIES["anchor"]
+
+    def super_repairs_badly(request):
+        if request["messages"][0]["content"].startswith("You write trading signal code"):
+            fixed = request["model"] == settings.models["ultra"]
+            return response(f"```python\n{anchor.fixed_code if fixed else anchor.code}```")
+        return like_a_real_model(request)
+
+    fake = FakeTokenFactory(super_repairs_badly)
+    trial = run_trial(
+        "buy assets below their long-run average",
+        synthetic_prices(seed=4),
+        settings=settings,
+        executor=LocalExecutor(),
+        llm=LLM(settings, client=fake),
+        log=silent,
+    )
+    coder = [
+        request["model"]
+        for request in fake.requests
+        if request["messages"][0]["content"].startswith("You write trading signal code")
+    ]
+    super_, ultra = settings.models["super"], settings.models["ultra"]
+    assert coder == [super_, super_, ultra]  # the draft, Super's repair, then Ultra's
+    assert trial.passed_time_travel and trial.caught_and_repaired

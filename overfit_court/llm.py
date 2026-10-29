@@ -45,7 +45,6 @@ from openai import BadRequestError, OpenAI, UnprocessableEntityError
 
 from .config import Settings
 
-REASONING = re.compile(r"<think>.*?</think>", re.DOTALL)
 UNFINISHED_REASONING = re.compile(r"<think>(?!.*</think>).*\Z", re.DOTALL)
 MAX_TOKENS_CAP = 32_000
 JSON_ONLY = "\n\nReply with a single JSON object and nothing else."
@@ -311,8 +310,12 @@ def _is_bad_request(e: Exception) -> bool:
 
 
 def strip_reasoning(text: str | None) -> str:
-    """Remove <think> blocks, including one the model never closed."""
-    text = REASONING.sub("", text or "")
+    """Remove <think> blocks, including one the model never closed, and reasoning that
+    arrives without its opening tag (a chat template that pre-fills "<think>" leaves
+    only the closing tag in the reply)."""
+    text = text or ""
+    if "</think>" in text:  # everything before the last closing tag is reasoning
+        text = text.rsplit("</think>", 1)[1]
     return UNFINISHED_REASONING.sub("", text).strip()
 
 
@@ -322,11 +325,20 @@ def parse_json(text: str) -> dict:
     text = re.sub(r"^```(?:json)?|```$", "", text, flags=re.MULTILINE).strip()
     try:
         parsed = json.loads(text)
-    except json.JSONDecodeError:
-        embedded = re.search(r"\{.*\}", text, re.DOTALL)
-        if not embedded:
-            raise
-        parsed = json.loads(embedded.group(0))
+    except json.JSONDecodeError as first_error:
+        # The last complete JSON object in the text, taken whole (not an object nested
+        # inside it): prose before it may contain braces that aren't JSON.
+        decoder, best = json.JSONDecoder(), None
+        for start in (i for i, ch in enumerate(text) if ch == "{"):
+            try:
+                candidate, end = decoder.raw_decode(text, start)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(candidate, dict) and (best is None or end > best[0]):
+                best = (end, candidate)
+        if best is None:
+            raise first_error from None
+        parsed = best[1]
     if not isinstance(parsed, dict):
         raise ValueError(f"expected a JSON object, got {type(parsed).__name__}")
     return parsed

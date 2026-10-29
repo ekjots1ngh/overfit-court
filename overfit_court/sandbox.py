@@ -50,7 +50,12 @@ import pandas as pd
 from contree_sdk import Contree
 from contree_sdk.auth import IAMAuth
 from contree_sdk.config import ContreeConfig
-from contree_sdk.sdk.exceptions import ContreeError, OperationTimedOutError
+from contree_sdk.sdk.exceptions import (
+    ApiStatusCodeError,
+    ContreeError,
+    FailedOperationError,
+    OperationTimedOutError,
+)
 
 from . import _harness
 
@@ -204,6 +209,7 @@ class NebiusSandboxExecutor:
 
     async def _run(self, code, prices, grid, jobs, time_travel) -> ExecutionResult:
         client = self._client or self._make_client()
+        await self._fit_account_limits(client)
         setup: list[dict] = []
         deps, from_cache = await self._dependencies_image(client, setup)
         try:
@@ -229,6 +235,31 @@ class NebiusSandboxExecutor:
         result.metrics = [metric for _, metric in done]
         result.setup = setup
         return result
+
+    async def _fit_account_limits(self, client) -> None:
+        """Check the credentials once, and keep the time limit within the account's.
+
+        A run asking for a longer instance timeout than the account allows is refused
+        outright, so the limit is lowered to fit. Bad credentials fail here, before
+        anything is uploaded. Anything else about the check is best effort.
+        """
+        get_info = getattr(client, "get_token_info", None)
+        if get_info is None:  # a stand-in client without the call
+            return
+        try:
+            info = await get_info()
+        except ApiStatusCodeError as e:
+            if e.status in (401, 403):
+                raise RuntimeError(
+                    f"Token Factory Sandboxes refused the credentials (HTTP {e.status}): check "
+                    "NEBIUS_API_KEY and NEBIUS_PROJECT_ID (a project with sandbox access)."
+                ) from e
+            return
+        except Exception:
+            return
+        limit = (getattr(info, "limits", None) or {}).get("instance_max_timeout")
+        if isinstance(limit, int | float) and 0 < limit < self.timeout_s:
+            self.timeout_s = int(limit)
 
     def _make_client(self) -> Contree:
         project = os.getenv("NEBIUS_PROJECT_ID") or os.getenv("CONTREE_PROJECT")
@@ -324,17 +355,33 @@ class NebiusSandboxExecutor:
                     cost_usd=float(out.result.cost or 0.0),
                 )
                 if out.exit_code != 0:
-                    timed_out = elapsed >= 0.99 * self.timeout_s  # killed at the time limit
+                    timed_out = _timed_out(out) or elapsed >= 0.99 * self.timeout_s
                     return failed(job, too_slow if timed_out else _tail(out.stderr)), metric
                 return decode(await out.read(f"{WORKDIR}/result.npz")), metric
             except OperationTimedOutError:  # the code ran too long: retrying won't help
                 metric["wall_s"] = round(time.perf_counter() - started, 3)
                 return failed(job, too_slow), metric
+            except FailedOperationError as e:
+                if "time" not in str(e.error).lower():  # not a time-out: the branch was lost
+                    lost = f"{type(e).__name__}: {e}"
+                    metric["wall_s"] = round(time.perf_counter() - started, 3)
+                    metric.setdefault("lost_tries", []).append(lost[:300])
+                    continue
+                metric["wall_s"] = round(time.perf_counter() - started, 3)
+                return failed(job, too_slow), metric  # the service stopped it at the limit
             except Exception as e:  # the branch was lost, not the code's fault
                 lost = f"{type(e).__name__}: {e}"
                 metric["wall_s"] = round(time.perf_counter() - started, 3)
                 metric.setdefault("lost_tries", []).append(lost[:300])
         return failed(job, lost, lost=True), metric
+
+
+def _timed_out(out) -> bool:
+    """Did the service stop this run at its time limit? (It says so in the process state.)"""
+    state = getattr(
+        getattr(getattr(getattr(out, "result", None), "_raw", None), "result", None), "state", None
+    )
+    return bool(getattr(state, "timed_out", False))
 
 
 # --- local subprocesses ---

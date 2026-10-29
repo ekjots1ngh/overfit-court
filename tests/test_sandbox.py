@@ -1,9 +1,11 @@
 """The Token Factory Sandboxes executor, against a stand-in for contree-sdk."""
 
 import json
+import uuid
 
 import numpy as np
 import pytest
+from contree_sdk.sdk.exceptions import ApiStatusCodeError, FailedOperationError
 from fake_contree import FakeContree
 
 from overfit_court import _harness
@@ -163,3 +165,43 @@ def test_executor_names_are_checked():
     assert isinstance(get_executor("nebius"), NebiusSandboxExecutor)
     with pytest.raises(ValueError, match="OC_EXECUTOR"):
         get_executor("nebuis")  # a typo must not quietly run model code on this machine
+
+
+class _AccountInfo:
+    """A FakeContree that also answers whoami, as the real client does."""
+
+    def __init__(self, limits=None, status=None):
+        self.limits, self.status = limits or {}, status
+
+    async def __call__(self, refresh=False):
+        if self.status:
+            raise ApiStatusCodeError(status=self.status, error="no")
+        return type("WhoAmI", (), {"limits": self.limits})()
+
+
+def test_the_time_limit_fits_the_accounts_and_bad_credentials_fail_first():
+    prices = synthetic_prices(n_days=300, seed=1)
+    fake = FakeContree()
+    fake.get_token_info = _AccountInfo({"instance_max_timeout": 600})
+    executor = NebiusSandboxExecutor(client=fake)
+    assert not executor.run(MOMENTUM, prices, GRID, 5.0).errors
+    assert executor.timeout_s == 600
+    refused = FakeContree()
+    refused.get_token_info = _AccountInfo(status=401)
+    with pytest.raises(RuntimeError, match="refused the credentials"):
+        NebiusSandboxExecutor(client=refused).run(MOMENTUM, prices, GRID, 5.0)
+    assert not refused.created  # nothing was uploaded or run
+
+
+def test_a_run_the_service_stops_at_its_time_limit_is_the_codes_fault(monkeypatch):
+    def stopped(self, shell, uploads):
+        if "runner.py" in shell:
+            raise FailedOperationError(operation_uuid=uuid.uuid4(), error="instance timed out")
+
+    monkeypatch.setattr(FakeContree, "lose_if_unlucky", stopped)
+    prices = synthetic_prices(n_days=300, seed=1)
+    result = NebiusSandboxExecutor(n_chunks=2, client=FakeContree()).run(
+        MOMENTUM, prices, GRID, 5.0
+    )
+    assert all("timed out" in e for e in result.errors.values())
+    assert result.time_travel["lost_configs"] == 0  # not a mistrial: it goes back for repair

@@ -163,3 +163,21 @@ def test_parsing_helpers():
         "Answer:\n```python\ndef positions(prices):\n    return 0\n```"
     )
     assert extract_code(two_blocks).startswith("def positions")
+
+
+def test_reasoning_without_its_opening_tag_is_stripped(live):
+    """A chat template that pre-fills <think> leaves only the closing tag in the reply."""
+    reply = (
+        'The JSON should look like {"risk": ...}. Fine.\n</think>\n\n{"risk": "low", "issues": []}'
+    )
+    llm, _ = live([response(reply)])
+    assert llm.chat_json("auditor", "nano", "s", "u", mock=no_mock) == {"risk": "low", "issues": []}
+    code = (
+        "I could write ```python\ndef positions(p): return p\n```\n</think>\n```python\nx = 1\n```"
+    )
+    assert extract_code(code) == "x = 1\n"
+
+
+def test_the_last_whole_json_object_is_taken_from_prose():
+    assert parse_json('Use {braces}? Here: {"a": {"b": 1}, "c": 2} done') == {"a": {"b": 1}, "c": 2}
+    assert parse_json('First {"a": 1} then {"b": 2}') == {"b": 2}

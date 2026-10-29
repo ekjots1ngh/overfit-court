@@ -116,10 +116,19 @@ def test_an_answer_cut_off_mid_way_is_asked_for_again_with_more_room(live):
     assert fake.requests[1]["max_tokens"] == 32000  # four times, up to the cap
 
 
-def test_a_model_id_that_differs_only_in_case_or_prefix_is_matched(settings):
+@pytest.mark.parametrize(
+    "configured, listed",
+    [
+        ("nvidia/nemotron-3-ultra-550b-a55b", "nvidia/Nemotron-3-Ultra-550b-a55b"),  # case
+        ("nemotron-3-super-120b-a12b", "nvidia/nemotron-3-super-120b-a12b"),  # organisation
+        ("nvidia/nemotron-3-nano-30b-a3b", "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B"),  # name
+    ],
+)
+def test_a_model_id_that_differs_only_in_case_or_prefix_is_matched(settings, configured, listed):
     settings.nebius_api_key = "test"
-    listed = "nvidia/" + settings.models["super"].split("/")[-1].upper()
-    fake = FakeTokenFactory([response("ok")], models=[listed])
+    settings.models["super"] = configured
+    others = ["nvidia/nemotron-3-super-120b-a12b-serverless", "nvidia/other-model"]
+    fake = FakeTokenFactory([response("ok")], models=[*others, listed])
     LLM(settings, client=fake).chat("coder", "super", "s", "u", mock=no_mock)
     assert fake.requests[0]["model"] == listed
 

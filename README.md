@@ -196,7 +196,7 @@ Deploy: the `Dockerfile` serves the app on port 8501 (for example on Nebius Serv
 
 ```bash
 pip install -r requirements-dev.txt
-pytest -q            # 144 tests, all offline, about six minutes
+pytest -q            # 146 tests, all offline, a few minutes
 ruff check . && ruff format --check .
 ```
 

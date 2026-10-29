@@ -13,8 +13,9 @@ template flag, `enable_thinking`.
 Live models misbehave in predictable ways, and each is handled here instead
 of crashing a trial:
 
-- the configured model id differs from the account's only in case or prefix:
-  the id the account lists is used;
+- the configured model id differs from the account's only in case or prefix
+  ("nvidia/", or "NVIDIA-" at the start of the name): the id the account lists
+  is used;
 - a request with optional parts (JSON mode, the thinking switch) is rejected:
   retry without each in turn, then without both. The part whose removal made
   it work is never sent to that model again; JSON mode gives way to asking for
@@ -197,8 +198,8 @@ class LLM:
                 self._listed = []
         if configured in self._listed:
             return configured
-        wanted = configured.lower().split("/")[-1]
-        matches = [listed for listed in self._listed if listed.lower().split("/")[-1] == wanted]
+        wanted = _bare_name(configured)
+        matches = [listed for listed in self._listed if _bare_name(listed) == wanted]
         return matches[0] if matches else configured
 
     def _send(
@@ -253,6 +254,15 @@ class LLM:
         )
         choice = response.choices[0]
         return choice.message.content or "", getattr(choice, "finish_reason", None)
+
+
+def _bare_name(model_id: str) -> str:
+    """A model id without case, organisation or a leading "nvidia-" in the name.
+
+    "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B" and "nemotron-3-nano-30b-a3b" are
+    the same model.
+    """
+    return model_id.lower().split("/")[-1].removeprefix("nvidia-")
 
 
 def _is_bad_request(e: Exception) -> bool:

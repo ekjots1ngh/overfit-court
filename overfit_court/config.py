@@ -77,11 +77,13 @@ def get_settings() -> Settings:
         nebius_api_key=os.getenv("NEBIUS_API_KEY"),
         base_url=os.getenv("NEBIUS_BASE_URL", "https://api.tokenfactory.nebius.com/v1/"),
         tavily_api_key=os.getenv("TAVILY_API_KEY"),
-        # Model ids differ between accounts: `python -m overfit_court.preflight` lists yours.
+        # The public endpoints' ids, as Token Factory's catalogue writes them (the three
+        # tiers follow three different conventions). `python -m overfit_court.preflight`
+        # lists the ids your account can use.
         models={
-            "nano": os.getenv("MODEL_NANO", "nvidia/nemotron-3-nano-30b-a3b"),
+            "nano": os.getenv("MODEL_NANO", "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B"),
             "super": os.getenv("MODEL_SUPER", "nvidia/nemotron-3-super-120b-a12b"),
-            "ultra": os.getenv("MODEL_ULTRA", "nvidia/nemotron-3-ultra-550b-a55b"),
+            "ultra": os.getenv("MODEL_ULTRA", "nvidia/Nemotron-3-Ultra-550b-a55b"),
         },
         # Only used to report spend; check your Token Factory console for current prices.
         token_prices={

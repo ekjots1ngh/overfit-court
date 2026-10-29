@@ -52,6 +52,40 @@ def test_the_dependencies_image_is_reused_only_with_the_same_versions():
     assert rebuilt.setup[0]["step"] == "dependencies image"
 
 
+def test_a_cached_image_the_service_no_longer_has_is_built_again():
+    prices = synthetic_prices(n_days=300, seed=1)
+    cache = NebiusSandboxExecutor.IMAGE_CACHE
+    cache.write_text(json.dumps({"image": "gone", "requirements": REQUIREMENTS}))
+    fake = FakeContree(forgotten={"gone"})
+    result = NebiusSandboxExecutor(client=fake).run(MOMENTUM, prices, GRID, 5.0)
+    assert not result.errors and result.time_travel["status"] == "passed"
+    assert [step["step"] for step in result.setup] == ["dependencies image", "trial checkpoint"]
+    assert json.loads(cache.read_text())["image"] != "gone"
+
+
+def test_a_read_only_disk_only_costs_the_cache(monkeypatch, tmp_path):
+    monkeypatch.setattr(NebiusSandboxExecutor, "IMAGE_CACHE", tmp_path / "missing" / "cache")
+    prices = synthetic_prices(n_days=300, seed=1)
+    result = NebiusSandboxExecutor(client=FakeContree()).run(MOMENTUM, prices, GRID, 5.0)
+    assert not result.errors and result.time_travel["status"] == "passed"
+
+
+def test_local_runs_never_see_credentials(monkeypatch):
+    monkeypatch.setenv("NEBIUS_API_KEY", "v1.secret")
+    monkeypatch.setenv("SOME_SERVICE_TOKEN", "secret")
+    snoops = (
+        "import os\n\n"
+        "def positions(prices, **params):\n"
+        "    found = [k for k in os.environ if 'KEY' in k or 'TOKEN' in k or 'NEBIUS' in k]\n"
+        "    if found:\n"
+        "        raise RuntimeError(f'saw {found}')\n"
+        "    return prices * 0\n"
+    )
+    prices = synthetic_prices(n_days=300, seed=2)
+    result = LocalExecutor(n_chunks=1).run(snoops, prices, GRID, 5.0)
+    assert not result.errors
+
+
 def test_a_crashing_strategy_reports_every_configuration():
     prices = synthetic_prices(n_days=300, seed=2)
     crashing = "def positions(prices, **params):\n    raise KeyError('nope')\n"

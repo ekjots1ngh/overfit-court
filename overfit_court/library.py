@@ -107,7 +107,7 @@ import pandas as pd
 def positions(prices: pd.DataFrame, day: int = 0, side: int = 1) -> pd.DataFrame:
     # decide at today's close whether to hold tomorrow; the next business
     # day's weekday is known from the calendar, no future prices needed
-    tomorrow = (prices.index.dayofweek + 1) % 5
+    tomorrow = (prices.index.day_of_week + 1) % 5
     hold = (tomorrow == day).astype(float)
     w = np.repeat(hold[:, None] * side, prices.shape[1], axis=1)
     return pd.DataFrame(w, index=prices.index, columns=prices.columns)

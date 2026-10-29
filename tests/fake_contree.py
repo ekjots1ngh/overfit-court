@@ -9,7 +9,8 @@ It can also lose branches, the way a network or API failure would:
 `flaky=n` loses the first n branch runs (a retry then succeeds), and
 `dead_config=key` loses every run of the branch holding that configuration.
 `slow_config=key` makes the branch holding that configuration time out, the
-way the real service reports a run past its time limit.
+way the real service reports a run past its time limit. `forgotten` holds image
+references the service no longer has: running from one fails as not found.
 """
 
 import asyncio
@@ -22,7 +23,7 @@ from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
-from contree_sdk.sdk.exceptions import OperationTimedOutError
+from contree_sdk.sdk.exceptions import ContreeImageNotFoundError, OperationTimedOutError
 
 WORKDIR = "/workspace"
 
@@ -35,18 +36,22 @@ class FakeImage:
         self.exit_code, self.stdout, self.stderr = 0, "", ""
         self.result = SimpleNamespace(cost=0.0, elapsed_time=timedelta(0))
         self._pending = None
+        self.missing = False  # the service has no such image
         contree.created.append(self)
 
     def run(self, shell, files=None, **_sdk_options):
         """Like the SDK: returns a new image to await; this one is never modified."""
         child = FakeImage(self.contree, self.files)
         child._pending = (shell, dict(files or {}))
+        child.missing = self.missing
         return child
 
     def __await__(self):
         return self._execute().__await__()
 
     async def _execute(self):
+        if self.missing:
+            raise ContreeImageNotFoundError(image_ref=str(self.uuid))
         shell, uploads = self._pending
         self.contree.lose_if_unlucky(shell, uploads)
         self.files.update(uploads)
@@ -83,15 +88,22 @@ class FakeImages:
     async def oci(self, _reference):
         return FakeImage(self._contree)
 
-    async def use(self, _reference):
-        return FakeImage(self._contree)
+    async def use(self, reference):
+        image = FakeImage(self._contree)
+        image.missing = str(reference) in self._contree.forgotten
+        return image
 
 
 class FakeContree:
     def __init__(
-        self, flaky: int = 0, dead_config: str | None = None, slow_config: str | None = None
+        self,
+        flaky: int = 0,
+        dead_config: str | None = None,
+        slow_config: str | None = None,
+        forgotten=(),
     ):
         self.created = []  # every image ever created, in order
+        self.forgotten = set(forgotten)
         self.images = FakeImages(self)
         self.flaky = flaky
         self.dead_config = dead_config

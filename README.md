@@ -179,7 +179,7 @@ python -m overfit_court.preflight    # checks models, thinking, JSON, sandboxes 
 streamlit run app.py
 ```
 
-The pre-flight check asks each tier the way the court does, reports anything a model refused, runs a real sandbox job against a local one, and ends with what to do next. With a key, backtests run in Token Factory Sandboxes by default, because model-written code then runs; `OC_EXECUTOR=local` runs them in subprocesses for development.
+The pre-flight check asks each tier the way the court does, reports anything a model refused, runs a real sandbox job against a local one, and ends with what to do next. With a key, backtests run in Token Factory Sandboxes by default, because model-written code then runs; `OC_EXECUTOR=local` runs them in subprocesses for development, and those subprocesses never get credentials from the environment.
 
 Real data: `pip install yfinance && python -m examples.fetch_prices sectors` writes `sectors.csv` (11 US sector ETFs), which the app and the command line accept:
 
@@ -190,13 +190,13 @@ python -m overfit_court fish --csv sectors.csv --target 1.0 --attempts 40
 
 The command line keeps its court record in `~/.overfit_court/`, so every run counts against the next one on the same data.
 
-Deploy: the `Dockerfile` serves the app on port 8501 (for example on Nebius Serverless Endpoints); CPU is enough, because the models run on Token Factory and the backtests in Token Factory Sandboxes.
+Deploy: the `Dockerfile` serves the app on port 8501 (for example on Nebius Serverless Endpoints); CPU is enough, because the models run on Token Factory and the backtests in Token Factory Sandboxes. On Streamlit Community Cloud, the same variables go in the app's Secrets. A public app with a live key is safe to leave up: with a key set, the code a model writes from a visitor's idea only ever runs in sandboxes (unless `OC_ALLOW_LOCAL=1`), and `OC_DAILY_BUDGET_USD` caps the day's model spend across every visitor, after which the app runs in demo mode until midnight UTC.
 
 ## Development
 
 ```bash
 pip install -r requirements-dev.txt
-pytest -q            # 146 tests, all offline, a few minutes
+pytest -q            # 155 tests, all offline, a few minutes
 ruff check . && ruff format --check .
 ```
 

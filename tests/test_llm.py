@@ -1,10 +1,13 @@
 """The Token Factory client against a fake Token Factory that misbehaves on purpose."""
 
+from datetime import date
+
 import openai
 import pytest
 from fake_token_factory import FakeTokenFactory, bad_request, response
 
-from overfit_court.llm import LLM, LLMError, extract_code, parse_json
+from overfit_court import llm as llm_module
+from overfit_court.llm import LLM, LLMError, Spend, extract_code, parse_json
 
 
 def no_mock():
@@ -131,6 +134,23 @@ def test_a_model_id_that_differs_only_in_case_or_prefix_is_matched(settings, con
     fake = FakeTokenFactory([response("ok")], models=[*others, listed])
     LLM(settings, client=fake).chat("coder", "super", "s", "u", mock=no_mock)
     assert fake.requests[0]["model"] == listed
+
+
+def test_every_call_adds_to_the_days_spend_shared_by_all_clients(settings):
+    settings.nebius_api_key = "test"
+    for _ in range(2):  # two clients, as two visitors of the app would have
+        fake = FakeTokenFactory([response("ok", prompt_tokens=1_000_000, completion_tokens=0)])
+        LLM(settings, client=fake).chat("auditor", "nano", "s", "u", mock=no_mock)
+    assert llm_module.SPEND.today() == pytest.approx(2 * settings.token_prices["nano"][0])
+
+
+def test_the_spend_starts_again_each_day():
+    clock = {"day": date(2026, 10, 29)}
+    spend = Spend(today=lambda: clock["day"])
+    spend.add(1.5)
+    assert spend.today() == 1.5
+    clock["day"] = date(2026, 10, 30)  # midnight UTC has passed
+    assert spend.today() == 0.0
 
 
 def test_parsing_helpers():

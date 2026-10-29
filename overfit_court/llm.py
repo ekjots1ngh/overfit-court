@@ -27,16 +27,19 @@ of crashing a trial:
 - rate limits, timeouts and server errors: the SDK retries with backoff.
 
 Every request, retries and failures included, is logged in `calls` with its
-tokens, latency and cost.
+tokens, latency and cost, and added to `SPEND`, this process's running total
+for the day, which the public app caps.
 """
 
 from __future__ import annotations
 
 import json
 import re
+import threading
 import time
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
+from datetime import UTC, date, datetime
 
 from openai import BadRequestError, OpenAI, UnprocessableEntityError
 
@@ -65,6 +68,39 @@ class Call:
     latency_s: float
     cost_usd: float
     note: str = ""  # why this request was a retry, or why it failed
+
+
+class Spend:
+    """Live model spend in this process for the current UTC day, across every client.
+
+    A public app serves many visitors from one process, so this is where its
+    daily cap (OC_DAILY_BUDGET_USD) is checked. It starts again at zero each day.
+    """
+
+    def __init__(self, today: Callable[[], date] = lambda: datetime.now(UTC).date()):
+        self._today = today
+        self._lock = threading.Lock()
+        self._day: date | None = None
+        self._usd = 0.0
+
+    def add(self, usd: float) -> None:
+        with self._lock:
+            self._roll()
+            self._usd += usd
+
+    def today(self) -> float:
+        """USD spent so far today."""
+        with self._lock:
+            self._roll()
+            return self._usd
+
+    def _roll(self) -> None:
+        today = self._today()
+        if today != self._day:
+            self._day, self._usd = today, 0.0
+
+
+SPEND = Spend()
 
 
 class LLM:
@@ -240,6 +276,8 @@ class LLM:
         input_tokens = getattr(usage, "prompt_tokens", 0) or 0
         output_tokens = getattr(usage, "completion_tokens", 0) or 0
         price_in, price_out = self.settings.token_prices[tier]  # USD per million tokens
+        cost = (input_tokens * price_in + output_tokens * price_out) / 1e6
+        SPEND.add(cost)
         self.calls.append(
             Call(
                 role=role,
@@ -248,7 +286,7 @@ class LLM:
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,
                 latency_s=round(time.perf_counter() - start, 3),
-                cost_usd=(input_tokens * price_in + output_tokens * price_out) / 1e6,
+                cost_usd=cost,
                 note=note,
             )
         )

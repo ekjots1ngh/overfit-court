@@ -46,6 +46,8 @@ class Settings:
     executor: str = "local"  # "nebius" (Token Factory Sandboxes) or "local" (subprocesses)
     max_configs: int = 120  # largest parameter grid tried in one trial
     cost_bps: float = 5.0  # trading cost per unit of turnover, in basis points
+    daily_budget_usd: float = 0.0  # cap on live model spend per day in the app; 0 = no cap
+    allow_local: bool = False  # may the app run model-written code locally with a key set?
 
     @property
     def mock_llm(self) -> bool:
@@ -94,4 +96,6 @@ def get_settings() -> Settings:
         executor=executor,
         max_configs=max_configs,
         cost_bps=_env_number("OC_COST_BPS", 5.0),
+        daily_budget_usd=_env_number("OC_DAILY_BUDGET_USD", 0.0),
+        allow_local=os.getenv("OC_ALLOW_LOCAL", "").strip().lower() in ("1", "true", "yes"),
     )

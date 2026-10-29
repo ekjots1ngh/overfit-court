@@ -32,6 +32,7 @@ single checkpoint, so they all run in parallel from the same starting state:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import io
 import json
 import os
@@ -49,7 +50,7 @@ import pandas as pd
 from contree_sdk import Contree
 from contree_sdk.auth import IAMAuth
 from contree_sdk.config import ContreeConfig
-from contree_sdk.sdk.exceptions import OperationTimedOutError
+from contree_sdk.sdk.exceptions import ContreeError, OperationTimedOutError
 
 from . import _harness
 
@@ -204,8 +205,18 @@ class NebiusSandboxExecutor:
     async def _run(self, code, prices, grid, jobs, time_travel) -> ExecutionResult:
         client = self._client or self._make_client()
         setup: list[dict] = []
-        deps = await self._dependencies_image(client, setup)
-        checkpoint = await self._trial_checkpoint(deps, code, prices.to_csv(), setup)
+        deps, from_cache = await self._dependencies_image(client, setup)
+        try:
+            checkpoint = await self._trial_checkpoint(deps, code, prices.to_csv(), setup)
+        except OperationTimedOutError:
+            raise
+        except ContreeError:
+            if not from_cache:
+                raise
+            # The service may have cleaned up the image cached by an earlier trial
+            # (an app can stay up for weeks): build it again, once.
+            deps, _ = await self._dependencies_image(client, setup, use_cache=False)
+            checkpoint = await self._trial_checkpoint(deps, code, prices.to_csv(), setup)
         if checkpoint.exit_code != 0:
             error = f"the strategy is not valid Python: {_tail(checkpoint.stderr)}"
             result = merge([failed(job, error) for job in jobs], grid, prices.index, time_travel)
@@ -234,11 +245,16 @@ class NebiusSandboxExecutor:
             return None
         return cache.get("image")
 
-    async def _dependencies_image(self, client, setup: list):
-        """python + numpy + pandas, built once and cached by UUID for later trials."""
-        cached = os.getenv("OC_SANDBOX_IMAGE") or self._cached_image()
+    async def _dependencies_image(self, client, setup: list, use_cache: bool = True):
+        """python + numpy + pandas, built once and cached by UUID for later trials.
+
+        Returns the image, and whether it came from this machine's cache file.
+        """
+        if os.getenv("OC_SANDBOX_IMAGE"):  # chosen by the user: never rebuilt behind their back
+            return await client.images.use(os.environ["OC_SANDBOX_IMAGE"]), False
+        cached = self._cached_image() if use_cache else None
         if cached:
-            return await client.images.use(cached)
+            return await client.images.use(cached), True
 
         t0 = time.perf_counter()
         base = await client.images.oci(self.BASE_IMAGE)
@@ -253,11 +269,13 @@ class NebiusSandboxExecutor:
                 f"an image with {REQUIREMENTS}, then set OC_SANDBOX_IMAGE. "
                 f"stderr: {_tail(deps.stderr)}"
             )
-        self.IMAGE_CACHE.write_text(
-            json.dumps({"image": str(deps.uuid), "requirements": REQUIREMENTS})
-        )
+        # A read-only disk only means the next trial builds the image again.
+        with contextlib.suppress(OSError):
+            self.IMAGE_CACHE.write_text(
+                json.dumps({"image": str(deps.uuid), "requirements": REQUIREMENTS})
+            )
         setup.append({"step": "dependencies image", "wall_s": round(time.perf_counter() - t0, 2)})
-        return deps
+        return deps, False
 
     async def _trial_checkpoint(self, deps, code: str, prices_csv: str, setup: list):
         """Upload the harness, the strategy and the data once; every job branches from here.
@@ -320,8 +338,28 @@ class NebiusSandboxExecutor:
 
 
 # --- local subprocesses ---
+SECRET_HINTS = ("KEY", "TOKEN", "SECRET", "PASSWORD", "CREDENTIAL")
+SERVICE_PREFIXES = ("NEBIUS_", "TAVILY_", "CONTREE_")
+
+
+def untrusted_environment() -> dict[str, str]:
+    """This process's environment variables minus anything that looks like a credential.
+
+    Model-written code may be told, by a prompt it was given, to look for keys.
+    """
+    return {
+        name: value
+        for name, value in os.environ.items()
+        if not any(hint in name.upper() for hint in SECRET_HINTS)
+        and not name.upper().startswith(SERVICE_PREFIXES)
+    }
+
+
 class LocalExecutor:
-    """Runs every job in its own subprocess on this machine (development only)."""
+    """Runs every job in its own subprocess on this machine (development only).
+
+    The subprocesses get no credentials from this process's environment.
+    """
 
     name = "local-subprocess"
 
@@ -353,6 +391,7 @@ class LocalExecutor:
                 proc = subprocess.run(
                     [sys.executable, "runner.py"],
                     cwd=folder,
+                    env=untrusted_environment(),
                     capture_output=True,
                     text=True,
                     timeout=self.timeout_s,

@@ -34,7 +34,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-from overfit_court import stories
+from overfit_court import llm, stories
 from overfit_court.config import Settings, get_settings
 from overfit_court.data import PLANTED_SIGNAL, load_csv, synthetic_prices
 from overfit_court.fishing import NemotronFisherman, ScriptedFisherman, run_expedition
@@ -691,12 +691,17 @@ def sidebar(settings: Settings):
         )
         settings.cost_bps = st.slider("Cost per unit turnover (bps)", 0.0, 20.0, settings.cost_bps)
         can_use_sandboxes = not settings.mock_llm
+        # With a key set, the code is written by a model from a visitor's idea, so it
+        # only runs in sandboxes unless the person deploying the app allows otherwise.
+        sandboxes_only = can_use_sandboxes and not settings.allow_local
+        sandboxes_first = sandboxes_only or (can_use_sandboxes and settings.executor == "nebius")
         where = st.radio(
             "Run backtests in",
             ["Token Factory Sandboxes", "Local (dev only)"],
-            index=0 if can_use_sandboxes and settings.executor == "nebius" else 1,
-            disabled=not can_use_sandboxes,
-            help="Sandboxes need NEBIUS_API_KEY and a project with sandbox access.",
+            index=0 if sandboxes_first else 1,
+            disabled=not can_use_sandboxes or sandboxes_only,
+            help="Sandboxes need NEBIUS_API_KEY and a project with sandbox access. With a key "
+            "set, model-written code only runs locally if OC_ALLOW_LOCAL=1.",
         )
         st.header("Court record")
         record_box = st.container()
@@ -1107,6 +1112,11 @@ def main() -> None:
     st.set_page_config(page_title="Overfit Court", page_icon="⚖️", layout="wide")
     html_block(CSS)
     settings = get_settings()
+    # A public app caps live model spend per day; past the cap it runs in demo mode.
+    budget = settings.daily_budget_usd
+    over_budget = not settings.mock_llm and budget > 0 and llm.SPEND.today() >= budget
+    if over_budget:
+        settings = settings.offline()
     st.session_state.setdefault("ledger", Ledger())
     st.session_state.setdefault("story", {})
     ledger: Ledger = st.session_state.ledger
@@ -1122,11 +1132,24 @@ def main() -> None:
         "never see, and lets the statistics, not the model, decide.</p>"
         f"<p class='define'>{html.escape(SHARPE)}</p></div>"
     )
-    if settings.mock_llm:
+    if over_budget:
+        st.info(
+            f"Demo mode until midnight UTC: today's ${budget:.2f} budget for live model calls on "
+            "this public app is used up. Model replies are canned and ideas are matched to a "
+            "built-in strategy library; the backtests, the time-travel test and the statistics "
+            "are all real."
+        )
+    elif settings.mock_llm:
         st.info(
             "Demo mode: no NEBIUS_API_KEY is set, so model replies are canned and ideas are "
             "matched to a built-in strategy library. The backtests, the time-travel test and "
             "the statistics are all real."
+        )
+    elif budget > 0:
+        st.caption(
+            f"Live: Nemotron 3 on Nebius Token Factory. ${llm.SPEND.today():.2f} of today's "
+            f"${budget:.2f} budget for this public app is spent; past it, the app switches to "
+            "demo mode until midnight UTC."
         )
 
     story, trial, fishing, how = st.tabs(

@@ -2,6 +2,7 @@
 
 import pytest
 
+from overfit_court import llm
 from overfit_court.config import get_settings
 from overfit_court.sandbox import NebiusSandboxExecutor
 
@@ -12,6 +13,8 @@ LIVE_VARIABLES = (
     "CONTREE_PROJECT",
     "OC_EXECUTOR",
     "OC_SANDBOX_IMAGE",
+    "OC_DAILY_BUDGET_USD",
+    "OC_ALLOW_LOCAL",
 )
 
 
@@ -21,6 +24,7 @@ def offline(monkeypatch, tmp_path):
     for name in LIVE_VARIABLES:
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setattr(NebiusSandboxExecutor, "IMAGE_CACHE", tmp_path / "sandbox_image")
+    monkeypatch.setattr(llm, "SPEND", llm.Spend())  # each test starts with nothing spent
 
 
 @pytest.fixture

@@ -24,12 +24,22 @@ def test_the_executor_defaults_to_sandboxes_once_model_code_can_run(monkeypatch)
         ("OC_COST_BPS", "-5", "at least 0"),  # a negative cost would pay strategies to trade
         ("OC_COST_BPS", "nan", "finite"),
         ("PRICE_SUPER_OUT", "inf", "finite"),
+        ("OC_DAILY_BUDGET_USD", "-1", "at least 0"),
     ],
 )
 def test_unusable_settings_are_errors(monkeypatch, variable, value, complaint):
     monkeypatch.setenv(variable, value)
     with pytest.raises(ValueError, match=complaint):
         get_settings()
+
+
+def test_the_public_app_switches(monkeypatch):
+    settings = get_settings()
+    assert settings.daily_budget_usd == 0 and not settings.allow_local  # no cap, sandboxes only
+    monkeypatch.setenv("OC_DAILY_BUDGET_USD", "2.5")
+    monkeypatch.setenv("OC_ALLOW_LOCAL", " Yes ")
+    settings = get_settings()
+    assert settings.daily_budget_usd == 2.5 and settings.allow_local
 
 
 def test_every_executor_name_has_an_executor():

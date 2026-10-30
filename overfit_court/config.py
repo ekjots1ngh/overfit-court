@@ -47,6 +47,7 @@ class Settings:
     max_configs: int = 120  # largest parameter grid tried in one trial
     cost_bps: float = 5.0  # trading cost per unit of turnover, in basis points
     daily_budget_usd: float = 0.0  # cap on live model spend per day in the app; 0 = no cap
+    daily_tavily_credits: int = 0  # cap on Tavily credits per day in the app; 0 = no cap
     allow_local: bool = False  # may the app run model-written code locally with a key set?
 
     @property
@@ -61,6 +62,11 @@ class Settings:
     def offline(self) -> Settings:
         """A copy with no API keys: demo mode, fully reproducible, nothing leaves the machine."""
         return replace(self, nebius_api_key=None, tavily_api_key=None)
+
+    def without_models(self) -> Settings:
+        """A copy with only the Nebius key removed: past the model budget, the agents use
+        library-based replies while the Tavily prior-art search stays live."""
+        return replace(self, nebius_api_key=None)
 
 
 def get_settings() -> Settings:
@@ -97,5 +103,6 @@ def get_settings() -> Settings:
         max_configs=max_configs,
         cost_bps=_env_number("OC_COST_BPS", 5.0),
         daily_budget_usd=_env_number("OC_DAILY_BUDGET_USD", 0.0),
+        daily_tavily_credits=_env_number("OC_DAILY_TAVILY_CREDITS", 0, int),
         allow_local=os.getenv("OC_ALLOW_LOCAL", "").strip().lower() in ("1", "true", "yes"),
     )

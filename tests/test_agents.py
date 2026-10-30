@@ -4,6 +4,7 @@ import json
 from unittest.mock import ANY
 
 import pytest
+from fake_tavily import fake_tavily
 from fake_token_factory import FakeTokenFactory, response
 
 from overfit_court import agents, research
@@ -63,7 +64,12 @@ def test_the_judge_cannot_contradict_the_verdict_or_return_a_string_of_reasons(s
 
 
 HITS = [
-    {"kind": "papers", "title": "Returns to buying winners (1993)", "url": "https://ex.org/a"},
+    {
+        "kind": "papers",
+        "title": "Returns to buying winners (1993)",
+        "url": "https://ex.org/a",
+        "content": "Portfolios are formed on the past 12-month return, skipping one month.",
+    },
     {"kind": "practice", "title": "Momentum, after costs", "url": "https://ex.org/b"},
 ]
 
@@ -74,9 +80,9 @@ def test_the_clerk_can_only_cite_what_the_search_found(settings):
         "summary": "Well known.",
         "cite": [1, 7, "0", True, 1, -1],  # out of range, not numbers, a repeat
         "published": {
-            "lookback": {"value": 252, "source": 0},
-            "skip": {"value": 21, "source": 9},  # a source that was never found
-            "made_up": {"value": 1, "source": 0},  # not a parameter of the plan
+            "lookback": {"value": 252, "source": 0, "quote": "the PAST  12-month return"},
+            "skip": {"value": 21, "source": 9, "quote": "skipping one month"},  # never found
+            "made_up": {"value": 1, "source": 0, "quote": "12-month"},  # not a parameter
         },
     }
     spec = {"param_grid": {"lookback": [60, 250], "skip": [0, 21]}}
@@ -88,20 +94,33 @@ def test_the_clerk_can_only_cite_what_the_search_found(settings):
         "lookback": {
             "value": 252,
             "source": {"title": HITS[0]["title"], "url": "https://ex.org/a", "kind": "papers"},
+            "quote": "the PAST 12-month return",  # case and spacing aside, the result's words
         }
     }
     assert found["already_known"] is None  # "yes" is not a boolean
 
 
+def test_a_published_value_needs_the_results_own_words(settings):
+    spec = {"param_grid": {"lookback": [60, 250], "skip": [0, 21]}}
+    for quote in ("twelve months", "", None, "12", "the past 12-month return, skipping two"):
+        reply = {"published": {"lookback": {"value": 252, "source": 0, "quote": quote}}}
+        found = agents.triage_prior_art(live(settings, json.dumps(reply)), spec, HITS)
+        assert found["published"] == {}, quote  # the paper doesn't say that
+    reply = {"published": {"skip": {"value": 21, "source": 0, "quote": "skipping one month."}}}
+    found = agents.triage_prior_art(live(settings, json.dumps(reply)), spec, HITS)
+    assert found["published"]["skip"]["value"] == 21
+
+
+def test_the_demo_clerk_summarises_the_hits_and_judges_nothing(settings):
+    found = agents.triage_prior_art(LLM(settings.offline()), {}, HITS, note="Replayed.")
+    assert found["already_known"] is None and found["published"] == {}
+    assert found["summary"].startswith("Replayed. The search found 1 paper and 1 practitioner")
+    assert "demo mode" in found["summary"] and len(found["citations"]) == 2
+
+
 def test_a_failed_search_is_reported_and_the_trial_goes_on(settings, monkeypatch):
-    class BrokenTavily:
-        def __init__(self, api_key):
-            pass
-
-        def search(self, *args, **kwargs):
-            raise ConnectionError("tavily is down")
-
-    monkeypatch.setattr(research, "TavilyClient", BrokenTavily)
+    monkeypatch.setattr(research, "CACHE", research.SearchCache())
+    monkeypatch.setattr(research, "TavilyClient", fake_tavily(fail=("papers", "practice")))
     settings.tavily_api_key = "test"
     search = research.prior_art(["momentum anomaly"], settings)
     assert search.hits == [] and "tavily is down" in search.note
@@ -111,34 +130,37 @@ def test_a_failed_search_is_reported_and_the_trial_goes_on(settings, monkeypatch
 
 
 def test_papers_and_practice_are_searched_merged_and_ranked(settings, monkeypatch):
-    class FakeTavily:
-        calls = []
+    shared = {"url": "https://ex.org/shared", "title": "Both found this"}
+    no_url = {"title": "no url", "score": 1.0}
 
-        def __init__(self, api_key):
-            pass
+    def papers(query):
+        found = {"url": f"https://ex.org/p/{query}", "score": 0.5}
+        return [{**shared, "score": 0.9}, found, no_url]
 
-        def search(self, query, **options):
-            FakeTavily.calls.append((query, tuple(options["include_domains"])))
-            kind = "papers" if "ssrn.com" in options["include_domains"] else "practice"
-            shared = {"url": "https://ex.org/shared", "title": "Both found this", "content": ""}
-            results = [
-                {**shared, "score": 0.9 if kind == "papers" else 0.4},
-                {"url": f"https://ex.org/{kind}/{query}", "title": kind, "score": 0.5},
-                {"title": "no url", "score": 1.0},
-            ]
-            return {"results": results, "usage": {"credits": 2}}
+    def practice(query):
+        return [{**shared, "score": 0.4}, {"url": f"https://ex.org/q/{query}", "score": 0.5}]
 
-    monkeypatch.setattr(research, "TavilyClient", FakeTavily)
+    fake = fake_tavily(papers=papers, practice=practice)
+    monkeypatch.setattr(research, "CACHE", research.SearchCache())
+    monkeypatch.setattr(research, "TavilyClient", fake)
     settings.tavily_api_key = "test"
     search = research.prior_art(["q1", "q2", "q3", "q4"], settings)
-    assert len(FakeTavily.calls) == 6  # three queries at most, each in papers and in practice
+    assert len(fake.calls) == 6  # three queries at most, each in papers and in practice
     urls = [hit["url"] for hit in search.hits]
     assert urls[0] == "https://ex.org/shared" and urls.count("https://ex.org/shared") == 1
     assert search.hits[0]["score"] == 0.9 and search.hits[0]["kind"] == "papers"  # best copy
-    assert [hit["score"] for hit in search.hits] == sorted(
-        (hit["score"] for hit in search.hits), reverse=True
+    assert search.hits[0]["found_in"] == 6  # found by every search: the top fused rank
+    assert [hit["rrf"] for hit in search.hits] == sorted(
+        (hit["rrf"] for hit in search.hits), reverse=True
     )
-    assert search.usage() == {"searches": 6, "failed": 0, "credits": 12, "slowest_s": ANY}
+    assert search.usage() == {
+        "searches": 6,
+        "failed": 0,
+        "cached": 0,
+        "credits": 12,
+        "slowest_s": ANY,
+        "recorded": None,
+    }
 
 
 def test_no_reply_at_all_never_crashes_a_trial(settings):

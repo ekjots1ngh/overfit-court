@@ -1,13 +1,15 @@
 """Trials end to end, and the rules that turn statistics into a verdict."""
 
 import itertools
+import json
 
 import numpy as np
 import pandas as pd
 import pytest
+from fake_tavily import fake_tavily
 from fake_token_factory import FakeTokenFactory, response
 
-from overfit_court import pipeline, stats
+from overfit_court import pipeline, research, stats
 from overfit_court._harness import LEAKED, PASSED, UNVERIFIED
 from overfit_court.agents import SpecError, audit, validate_spec
 from overfit_court.data import PLANTED_SIGNAL, synthetic_prices
@@ -284,23 +286,134 @@ def test_overrides_only_ever_make_the_verdict_stricter():
     assert final_verdict(ACQUITTED, PASSED, audit_risk="low") == ACQUITTED
 
 
-def test_the_literatures_own_configuration_is_tested_on_its_own():
+def test_the_literatures_own_configuration_is_tested_exactly_or_not_at_all():
     combos = itertools.product([60, 120, 250], [0, 21])
     grid = {f"k{i}": {"lookback": lb, "skip": sk} for i, (lb, sk) in enumerate(combos)}
-    returns = pd.DataFrame(
-        np.random.default_rng(0).normal(0.0005, 0.01, (1000, 6)), columns=list(grid)
-    )
     paper = {"title": "Returns to buying winners", "url": "https://ex.org/a", "kind": "papers"}
     published = {
-        "lookback": {"value": 252, "source": paper},  # a year of trading days
+        "lookback": {"value": 252, "source": paper},  # a year of trading days: not a grid value
         "skip": {"value": 21, "source": paper},
     }
-    test = pipeline.literature_test(published, grid, returns)
-    assert test["params"] == {"lookback": 250, "skip": 21} and not test["exact"]
-    assert test["sources"] == [paper]
-    assert test["p_value"] == pytest.approx(stats.single_test_p_value(returns["k5"]), abs=1e-6)
-    # Every parameter needs a published value, or there is nothing pre-registered.
-    assert pipeline.literature_test({"lookback": published["lookback"]}, grid, returns) is None
-    # If that configuration never ran, the nearest one that did is used.
-    nearest = pipeline.literature_test(published, grid, returns.drop(columns="k5"))
-    assert nearest["params"] in ({"lookback": 120, "skip": 21}, {"lookback": 250, "skip": 0})
+    # Before the build, the published configuration joins the grid under its own key.
+    added, note = pipeline.pre_register(published, grid)
+    assert note is None and added["lit000"] == {"lookback": 252, "skip": 21}
+    assert len(added) == len(grid) + 1 and all(k in added for k in grid)
+    returns = pd.DataFrame(
+        np.random.default_rng(0).normal(0.0005, 0.01, (1000, 7)), columns=list(added)
+    )
+    test = pipeline.literature_test(published, added, returns)
+    assert test["key"] == "lit000" and test["params"] == {"lookback": 252, "skip": 21}
+    assert test["exact"] and test["n_configs"] == 1 and test["free"] == []
+    assert test["published"] == {"lookback": 252, "skip": 21}
+    assert test["source"] == paper["title"] and test["sources"] == [paper]
+    assert test["p_value"] == pytest.approx(stats.single_test_p_value(returns["lit000"]), abs=1e-6)
+    # A value outside the grid's range is refused, never snapped to the nearest value.
+    months = {"lookback": {"value": 12, "source": paper}, "skip": published["skip"]}
+    same, note = pipeline.pre_register(months, grid)
+    assert same == grid and "lookback 12" in note and "20" not in note and "60 to 250" in note
+    assert pipeline.literature_test(months, grid, returns) is None
+    # Grid values already there are not added twice; a configuration that never ran is no test.
+    on_grid = {"lookback": {"value": 250, "source": paper}, "skip": published["skip"]}
+    assert pipeline.pre_register(on_grid, grid)[0] == grid
+    assert pipeline.literature_test(on_grid, grid, returns)["key"] == "k5"
+    assert pipeline.literature_test(on_grid, grid, returns.drop(columns="k5")) is None
+
+
+def test_a_partly_published_configuration_is_a_reality_check_over_its_slice():
+    grid = expand_grid({"lookback": [60, 250], "skip": [0, 21], "top_frac": [0.2, 0.3]}, 50)
+    paper = {"title": "Returns to buying winners", "url": "https://ex.org/a", "kind": "papers"}
+    published = {"lookback": {"value": 252, "source": paper}}  # skip and top_frac left free
+    added, note = pipeline.pre_register(published, grid)
+    slice_keys = [k for k in added if k.startswith("lit")]
+    assert note is None and len(slice_keys) == 4  # 2 skips x 2 top_fracs at lookback 252
+    assert all(added[k]["lookback"] == 252 for k in slice_keys)
+    returns = pd.DataFrame(
+        np.random.default_rng(1).normal(0.0002, 0.01, (800, len(added))), columns=list(added)
+    )
+    test = pipeline.literature_test(published, added, returns, seed=3, n_boot=100)
+    assert test["n_configs"] == 4 and test["free"] == ["skip", "top_frac"]
+    best = max(slice_keys, key=lambda k: stats.sharpe(returns[k]))
+    assert test["key"] == best
+    expected = stats.reality_check(
+        returns[slice_keys].to_numpy(), stats.sharpe(returns[best]), n_boot=100, seed=3
+    ).p_value
+    assert test["p_value"] == pytest.approx(expected, abs=1e-6)
+    # Too many configurations consistent with the sources: nothing is added, and it says why.
+    wide = expand_grid({"a": [1, 2], "b": list(range(10)), "c": list(range(10))}, 1000)
+    same, note = pipeline.pre_register({"a": {"value": 1, "source": paper}}, wide)
+    assert same == wide and "100 configurations" in note
+
+
+def test_the_published_configuration_runs_exactly_and_can_face_the_sealed_evidence(
+    settings, silent, monkeypatch
+):
+    """With the fake Tavily and a fake clerk: added to the grid, tested alone, committed to
+    through the evidence room, and the second opening corrected for the first."""
+    momentum = FAMILIES["momentum"]
+    paper = "Stocks are ranked on past 12-month returns, skipping the most recent month; the "
+    paper += "top and bottom 30% form the winner and loser portfolios."
+    monkeypatch.setattr(research, "CACHE", research.SearchCache())
+    monkeypatch.setattr(
+        research,
+        "TavilyClient",
+        fake_tavily(
+            papers=[{"url": "https://ssrn.com/abstract=1", "title": "Winners", "content": paper}],
+            practice=[{"url": "https://quantpedia.com/m", "title": "After costs"}],
+        ),
+    )
+    settings.tavily_api_key = settings.nebius_api_key = "test"
+
+    def model(request):
+        system = request["messages"][0]["content"]
+        if system.startswith("You write trading signal code"):
+            return response(f"```python\n{momentum.code}```")
+        if system.startswith("You triage web search results"):
+            quote = "skipping the most recent month"
+            return response(
+                json.dumps(
+                    {
+                        "already_known": True,
+                        "summary": "Classic 12-1 momentum.",
+                        "cite": [0, 1],
+                        "published": {
+                            "lookback": {"value": 252, "source": 0, "quote": "past 12-month"},
+                            "skip": {"value": 21, "source": 0, "quote": quote},
+                            "top_frac": {"value": 0.3, "source": 0, "quote": "bottom 30%"},
+                        },
+                    }
+                )
+            )
+        return response("{}")  # the auditor and the judge say nothing useful
+
+    trial = run_trial(
+        "buy recent winners",
+        synthetic_prices(seed=7, signal=PLANTED_SIGNAL),
+        settings=settings,
+        executor=InProcessExecutor(),
+        llm=LLM(settings, client=FakeTokenFactory(model)),
+        spec=spec_for(momentum),
+        log=silent,
+    )
+    test = trial.prior_art["literature_test"]
+    assert test["key"] == "lit000" and test["exact"] and test["n_configs"] == 1
+    assert test["params"] == {"lookback": 252, "skip": 21, "top_frac": 0.3}
+    assert trial.grid["lit000"] == test["params"] and "lit000" in trial.returns
+    assert trial.prior_art["published"]["skip"]["quote"] == "skipping the most recent month"
+    assert len(trial.prior_art["searches"]) == 4  # two queries, papers and practice each
+    assert trial.prior_art["literature_note"] is None
+    evidence = trial.evidence()
+    assert evidence["literature_test"]["source"] == "Winners" and evidence["prior_art_known"]
+    assert evidence["prior_art_citations"] == ["Winners", "After costs"]
+    assert any("sources name lookback 252" in line for line in trial.opinion["reasoning"])
+    record = court_record_markdown(trial)
+    assert "(lookback 252, skip 21, top_frac 0.3), tested on its own" in record
+    assert "nearest tested" not in record
+
+    winner = unseal(trial, executor=InProcessExecutor(), log=silent)
+    assert winner.times_opened_before == 0 and winner.committed_params == trial.findings.best_params
+    published = unseal(trial, params=test["params"], executor=InProcessExecutor(), log=silent)
+    assert published.committed_params == test["params"] and published.times_opened_before == 1
+    assert published.open_sharpe_annual == pytest.approx(test["sharpe_annual"], abs=1e-3)
+    assert trial.record["dataset"] and len(trial.ledger.seals(trial.record["dataset"])) == 2
+    with pytest.raises(ValueError, match="this trial ran"):
+        unseal(trial, params={"lookback": 999, "skip": 0, "top_frac": 0.2}, log=silent)

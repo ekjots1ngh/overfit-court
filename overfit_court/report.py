@@ -66,30 +66,53 @@ def _summary_rows(trial) -> list[tuple[str, str]]:
     ]
 
 
+def params_in_words(params: dict) -> str:
+    """Parameters as words, "lookback 250, skip 21, top_frac 0.3", never a Python dict."""
+    return ", ".join(f"{name} {value:g}" for name, value in params.items())
+
+
 def literature_sentence(test: dict) -> str:
     """The literature's own configuration, tested on its own, in one sentence."""
-    named = ", ".join(f"{k} {v}" for k, v in test["published"].items())
-    tested = "" if test["exact"] else f" (nearest tested: {test['params']})"
+    named = params_in_words(test["published"])
+    if test.get("n_configs", 1) == 1:
+        return (
+            f"The configuration the sources name ({named}), tested on its own: Sharpe "
+            f"{test['sharpe_annual']:.2f}, {fmt_p(test['p_value'])} as a single test fixed in "
+            "advance, so with no correction for the search."
+        )
+    free = test.get("free") or [n for n in test["params"] if n not in test["published"]]
+    best = params_in_words({n: test["params"][n] for n in free})
     return (
-        f"The configuration the sources name ({named}){tested}: Sharpe "
-        f"{test['sharpe_annual']:.2f}, {fmt_p(test['p_value'])} as a single test fixed in "
-        "advance, so with no correction for the search."
+        f"The sources fix {named}; of the {test['n_configs']} configurations consistent with "
+        f"that ({', '.join(free)} left free), the best is {best}: Sharpe "
+        f"{test['sharpe_annual']:.2f}, {fmt_p(test['p_value'])} by a Reality Check over those "
+        f"{test['n_configs']} alone."
     )
 
 
 def prior_art_points(prior_art: dict) -> tuple[str, list[dict], str | None]:
-    """(summary, sources to list, the literature test sentence or None), for both records."""
+    """(summary, sources to list, the literature test sentence or None), for both records.
+
+    With published values but no test, the third item says why (a value outside
+    the grid, say) instead.
+    """
     sources = prior_art.get("citations") or prior_art.get("top_results") or []
     test = prior_art.get("literature_test")
     searched = prior_art.get("search") or {}
     summary = prior_art.get("summary") or ""
     if searched.get("searches"):
-        summary += (
-            f" ({searched['searches']} Tavily searches of papers and practitioner research"
-            + (f", {searched['credits']} credits" if searched.get("credits") is not None else "")
-            + ")"
-        )
-    return summary.strip(), sources, literature_sentence(test) if test else None
+        parts = [f"{searched['searches']} Tavily searches of papers and practitioner research"]
+        if searched.get("credits") is not None:
+            parts.append(f"{searched['credits']} credits")
+        if searched.get("cached"):
+            parts.append(f"{searched['cached']} from today's cache")
+        if searched.get("failed"):
+            parts.append(f"{searched['failed']} failed")
+        if searched.get("recorded"):
+            parts.append(f"recorded live on {searched['recorded']}")
+        summary += f" ({', '.join(parts)})"
+    literature = literature_sentence(test) if test else prior_art.get("literature_note")
+    return summary.strip(), sources, literature or None
 
 
 # An opening counts even when it gives no valid result, so the record says so.

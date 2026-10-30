@@ -1115,8 +1115,8 @@ def main() -> None:
     # A public app caps live model spend per day; past the cap it runs in demo mode.
     budget = settings.daily_budget_usd
     over_budget = not settings.mock_llm and budget > 0 and llm.SPEND.today() >= budget
-    if over_budget:
-        settings = settings.offline()
+    if over_budget:  # models off; Tavily stays on, with its own daily credit cap
+        settings = settings.without_models()
     st.session_state.setdefault("ledger", Ledger())
     st.session_state.setdefault("story", {})
     ledger: Ledger = st.session_state.ledger

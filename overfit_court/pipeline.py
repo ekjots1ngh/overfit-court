@@ -23,6 +23,7 @@ unseal(trial)
 from __future__ import annotations
 
 import hashlib
+import itertools
 import json
 import math
 import random
@@ -362,7 +363,19 @@ class Trial:
             "time_travel_detail": None if status == PASSED else _harness.describe(self.time_travel),
             "repairs": max(0, len(self.code_history) - 1),
             "prior_art_known": self.prior_art.get("already_known"),
+            "prior_art_citations": [
+                c["title"] for c in (self.prior_art.get("citations") or [])[:3]
+            ],
+            "literature_test": self._literature_for_judge(),
         }
+
+    def _literature_for_judge(self) -> dict | None:
+        """The literature test as the judge sees it: the numbers and the source, not the keys."""
+        test = self.prior_art.get("literature_test")
+        if not test:
+            return None
+        keys = ("published", "params", "n_configs", "sharpe_annual", "p_value", "source", "url")
+        return {k: test.get(k) for k in keys}
 
     def _sealed_evidence(self):
         if self.sealed:
@@ -458,6 +471,13 @@ def run_trial(
         search = prior_art(spec["search_queries"], settings)
         found = agents.triage_prior_art(llm, spec, search.hits, search.note)
         found["search"] = search.usage()
+        found["searches"] = search.searches
+        # The configuration the sources name joins the grid before any code runs: fixed
+        # before this data was seen, it is tested exactly, time-travel test and all.
+        grid, found["literature_note"] = pre_register(found.get("published"), grid)
+        added = [k for k in grid if k.startswith(LITERATURE_KEY)]
+        if added:
+            log(f"Adding the published configuration to the grid ({len(added)} to run exactly).")
 
     # From the first backtest on, the trial goes on the court record whatever
     # happens: configurations that ran were research on this data, even if the
@@ -502,8 +522,17 @@ def run_trial(
                 n_boot=n_boot,
             )
         found["literature_test"] = literature_test(
-            found.get("published"), result.grid, result.returns
+            found.get("published"),
+            result.grid,
+            result.returns,
+            seed=record_seed(key),
+            n_boot=n_boot,
         )
+        untested = found.get("published") and not found["literature_test"]
+        if untested and not found["literature_note"]:
+            found["literature_note"] = (
+                "The published configuration ran but produced no returns, so it was not tested."
+            )
         history = ledger.history(key)
         data_source = describe_data(prices_full)
         if prices is None:
@@ -553,44 +582,108 @@ def run_trial(
     return trial
 
 
-def literature_test(published: dict | None, grid: dict, returns: pd.DataFrame) -> dict | None:
+LITERATURE_KEY = "lit"  # grid keys of the configurations the literature added
+PRE_REGISTER_LIMIT = 12  # most configurations the literature may add to a grid
+OVERSHOOT = 0.1  # how far past the grid's ends a published value may lie, as a share
+
+
+def _fixed(published: dict | None, grid: dict) -> tuple[list[str], dict]:
+    """(the grid's parameter names, the values the sources fix among them)."""
+    if not published or not grid:
+        return [], {}
+    names = list(next(iter(grid.values())))
+    return names, {n: published[n]["value"] for n in names if n in published}
+
+
+def pre_register(
+    published: dict | None, grid: dict, limit: int = PRE_REGISTER_LIMIT
+) -> tuple[dict, str | None]:
+    """The grid with the configuration the literature names added, or why it wasn't.
+
+    Values a paper fixed before this data was seen are a pre-registration, so
+    they join the grid before any code runs and are tested at exactly those
+    values. A value may overshoot the grid's ends by a tenth (252 days against
+    a grid that stops at 250); beyond that it is refused, never snapped to the
+    nearest grid value (a "12" that meant months would be tested as a lookback
+    of 20 and called the paper's). Parameters the sources leave free range over
+    the grid's values; if that slice is bigger than `limit`, nothing is added.
+    """
+    names, fixed = _fixed(published, grid)
+    if not fixed:
+        return grid, None
+    values = {n: sorted({float(p[n]) for p in grid.values()}) for n in names}
+
+    def within(name: str, value) -> bool:
+        low, high = values[name][0], values[name][-1]
+        return low - abs(low) * OVERSHOOT <= float(value) <= high + abs(high) * OVERSHOOT
+
+    outside = [n for n, v in fixed.items() if not within(n, v)]
+    if outside:
+        named = "; ".join(
+            f"{n} {fixed[n]:g} (the grid runs {values[n][0]:g} to {values[n][-1]:g})"
+            for n in outside
+        )
+        return grid, f"The sources name {named}, outside the grid, so it was not tested."
+    free = [n for n in names if n not in fixed]
+    combos = list(itertools.product(*(values[n] for n in free)))
+    if len(combos) > limit:
+        return grid, (
+            f"The sources fix only {', '.join(fixed)}; the {len(combos)} configurations "
+            f"consistent with that are too many to add to the grid (at most {limit})."
+        )
+    existing = {tuple(float(p[n]) for n in names) for p in grid.values()}
+    added = dict(grid)
+    for i, combo in enumerate(combos):
+        params = {**fixed, **dict(zip(free, combo, strict=True))}
+        params = {n: agents._parameter_value(params[n]) for n in names}  # the grid's order
+        if tuple(float(params[n]) for n in names) not in existing:
+            added[f"{LITERATURE_KEY}{i:03d}"] = params
+    return added, None
+
+
+def literature_test(
+    published: dict | None, grid: dict, returns: pd.DataFrame, *, seed: int = 0, n_boot: int = 500
+) -> dict | None:
     """The configuration the literature names, tested on its own.
 
-    Parameter values a paper published before this data was seen are a
-    pre-registration: that one configuration, tested alone, needs no correction
-    for the search around it. Each published value is matched to the nearest
-    value in the grid, and then the nearest configuration that ran is used
-    (`exact` says whether it is the published one). It needs a published value
-    for every parameter. On real data the papers' own sample may overlap this
-    one, so the test is only fully clean on later dates, as the README says.
+    Over the configurations consistent with every published value (one, when
+    the sources fix every parameter): a single pre-registered test when there
+    is one, needing no correction for the search around it; otherwise the best
+    of them by a Reality Check over those alone, so only the parameters the
+    sources left free are corrected for. On real data the papers' own sample
+    may overlap this one, so the test is only fully clean on later dates, as
+    the README says.
     """
-    names = {name for params in grid.values() for name in params}
-    if not published or not names or set(published) != names:
+    names, fixed = _fixed(published, grid)
+    if not fixed:
         return None
-    values = {name: sorted({params[name] for params in grid.values()}) for name in names}
-
-    def nearest(name: str) -> int:  # position of the grid value closest to the published one
-        target = published[name]["value"]
-        return min(range(len(values[name])), key=lambda i: abs(values[name][i] - target))
-
-    wanted = {name: nearest(name) for name in names}
-    ran = [key for key in grid if key in returns.columns]
+    consistent = [
+        k for k, p in grid.items() if all(float(p[n]) == float(v) for n, v in fixed.items())
+    ]
+    ran = [k for k in consistent if k in returns.columns]
     if not ran:
         return None
-
-    def distance(key) -> int:
-        return sum(abs(values[n].index(grid[key][n]) - wanted[n]) for n in names)
-
-    key = min(ran, key=distance)
-    r = returns[key].to_numpy()
-    sources = {published[name]["source"]["url"]: published[name]["source"] for name in names}
+    sharpes = {k: stats.sharpe(returns[k].to_numpy()) for k in ran}
+    key = max(ran, key=sharpes.get)
+    if len(ran) == 1:
+        p_value = stats.single_test_p_value(returns[key].to_numpy())
+    else:
+        p_value = stats.reality_check(
+            returns[ran].to_numpy(), sharpes[key], n_boot=n_boot, seed=seed
+        ).p_value
+    sources = {published[n]["source"]["url"]: published[n]["source"] for n in fixed}
+    first = next(iter(sources.values()))
     return {
-        "published": {name: published[name]["value"] for name in sorted(names)},
+        "published": {n: fixed[n] for n in names if n in fixed},
+        "free": [n for n in names if n not in fixed],
+        "exact": True,  # a published value is tested at exactly that value, or not at all
         "params": grid[key],
-        "exact": distance(key) == 0
-        and all(values[n][wanted[n]] == published[n]["value"] for n in names),
-        "sharpe_annual": round(stats.annualise(stats.sharpe(r)), 4),
-        "p_value": round(stats.single_test_p_value(r), 6),
+        "key": key,
+        "n_configs": len(ran),
+        "sharpe_annual": round(stats.annualise(sharpes[key]), 4),
+        "p_value": round(float(p_value), 6),
+        "source": first["title"],
+        "url": first["url"],
         "sources": list(sources.values()),
     }
 
@@ -810,8 +903,26 @@ def unseal_strategy(
     return outcome
 
 
-def unseal(trial: Trial, *, executor=None, log: Log = print) -> SealedResult:
-    """Open the evidence room for the trial's winning configuration.
+def ran_as(trial: Trial, params: dict) -> str:
+    """The grid key under which this trial ran `params`; a ValueError if it never did."""
+    wanted = {name: agents._parameter_value(value) for name, value in params.items()}
+    for key, candidate in trial.grid.items():
+        if candidate == wanted and key in trial.returns.columns:
+            return key
+    raise ValueError(
+        f"Only a configuration this trial ran can be committed to, and {params} was not one."
+    )
+
+
+def unseal(
+    trial: Trial, *, params: dict | None = None, executor=None, log: Log = print
+) -> SealedResult:
+    """Open the evidence room for the trial's winning configuration, or for `params`.
+
+    `params` lets the commitment be another configuration this trial ran: the
+    one the literature named (`trial.prior_art["literature_test"]["params"]`),
+    fixed before this data existed. Each opening is recorded and corrected for
+    in the next, whichever configuration it tested.
 
     Refused unless the strategy passed the time-travel test: one that reads
     the future would read the sealed evidence too, so the test would prove
@@ -822,6 +933,7 @@ def unseal(trial: Trial, *, executor=None, log: Log = print) -> SealedResult:
     """
     if trial.cut is None:
         raise ValueError("This trial was run without sealed evidence.")
+    key = trial.findings.best_key if params is None else ran_as(trial, params)
     if not trial.passed_time_travel:
         if trial.time_traveller:
             why = "this strategy reads the future"
@@ -839,8 +951,8 @@ def unseal(trial: Trial, *, executor=None, log: Log = print) -> SealedResult:
     try:
         trial.sealed = unseal_strategy(
             trial.code,
-            trial.findings.best_params,
-            open_sharpe=trial.findings.best_sharpe,
+            trial.grid[key],
+            open_sharpe=stats.sharpe(trial.returns[key].to_numpy()),
             key=trial.record["dataset"],
             cut=trial.cut,
             cost_bps=trial.cost_bps,

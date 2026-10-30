@@ -22,9 +22,8 @@ import os
 import time
 
 import numpy as np
-from tavily import TavilyClient
 
-from . import _harness
+from . import _harness, research
 from .config import Settings, get_settings
 from .data import synthetic_prices
 from .library import FAMILIES
@@ -142,18 +141,18 @@ def check_sandboxes() -> None:
 
 
 def check_tavily(settings: Settings) -> None:
-    try:
-        t0 = time.perf_counter()
-        response = TavilyClient(api_key=settings.tavily_api_key).search(
-            "time series momentum anomaly", max_results=2
-        )
-        report(
-            PASS,
-            "Tavily search",
-            f"{len(response.get('results', []))} results, {time.perf_counter() - t0:.1f}s",
-        )
-    except Exception as e:
-        report(FAIL, "Tavily search", f"{type(e).__name__}: {e}")
+    """The court's own search (advanced depth, both domain lists, usage), one kind per line."""
+    search = research.prior_art(["time series momentum"], settings)
+    for record in search.searches:
+        ok = record["results"] > 0 and not record["error"]
+        detail = f"{record['results']} results, {record['credits']} credits, {record['latency_s']}s"
+        if record["error"]:
+            detail += f", {record['error']}"
+        elif not ok:
+            detail += "; check the domain list in research.SOURCES against a search without it"
+        report(PASS if ok else FAIL, f"Tavily {record['kind']} search", detail)
+    if not search.searches:
+        report(FAIL, "Tavily search", search.note or "no search ran")
 
 
 def main() -> None:

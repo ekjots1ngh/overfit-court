@@ -433,10 +433,45 @@ CLERK_SYS = """You triage web search results about a trading idea: has the effec
 already been published? The results are numbered. Reply JSON only:
 {"already_known": true or false, "summary": str (at most two sentences),
  "cite": [result numbers] (at most 3, the ones that best show whether it is known),
- "published": {"<parameter>": {"value": number, "source": result number}}}
+ "published": {"<parameter>": {"value": number, "source": result number, "quote": str}}}
 "published" is only for the parameters listed, in the units of their grid values
 (on daily data a 12-month lookback is about 252 days), and only for values a
-result states outright. Otherwise leave it {}. Use nothing that is not in the results."""
+result states outright: "quote" is that result's own words stating the value,
+copied exactly. Otherwise leave it {}. Use nothing that is not in the results."""
+
+MIN_QUOTE = 6  # characters: a lone digit would be "found" in any result
+KIND_WORDS = {"papers": "paper", "practice": "practitioner write-up"}
+
+
+def _squash(text) -> str:
+    """Text for comparison: one case, single spaces, no quotation marks around it."""
+    return " ".join(str(text or "").lower().split()).strip("\"'“”‘’ ")
+
+
+def _quoted(quote, content: str) -> bool:
+    """Does the clerk's quote appear, word for word, in the result it cites?"""
+    words = _squash(quote)
+    return len(words) >= MIN_QUOTE and words in _squash(content)
+
+
+def _offline_triage(found: list[dict], note: str | None) -> str:
+    """Demo mode's clerk reply: what the search found, in plain words, judging nothing."""
+    counts: dict[str, int] = {}
+    for hit in found:
+        word = KIND_WORDS.get(hit.get("kind"), "result")
+        counts[word] = counts.get(word, 0) + 1
+    what = " and ".join(f"{n} {word}{'s' if n != 1 else ''}" for word, n in counts.items())
+    summary = (
+        f"{note} " if note else ""
+    ) + f"The search found {what}; the top results are listed. No model read them (demo mode)."
+    return json.dumps(
+        {
+            "already_known": None,
+            "summary": summary,
+            "cite": list(range(min(3, len(found)))),
+            "published": {},
+        }
+    )
 
 
 def _result_number(value, n: int) -> int | None:
@@ -457,9 +492,11 @@ def triage_prior_art(llm: LLM, spec: dict, hits: list[dict], note: str | None = 
 
     Citing by number means the clerk can only point at what the search found.
     It also reports any parameter values the sources state, for the plan's own
-    parameters: the court tests that configuration on its own (see
-    pipeline.literature_test). The top results are kept either way, so the
-    record shows what was found even if the triage fails.
+    parameters, each with the words that state it: a value is kept only if its
+    quote really is in the cited result. The court then tests that
+    configuration on its own (see pipeline.literature_test). The top results
+    are kept either way, so the record shows what was found even if the triage
+    fails. In demo mode the clerk's reply is a plain summary of the hits.
     """
     found = [hit for hit in hits if hit.get("url")]
     top = [_cited(hit) for hit in found[:5]]
@@ -476,7 +513,13 @@ def triage_prior_art(llm: LLM, spec: dict, hits: list[dict], note: str | None = 
         f"Parameters and their grid values: {json.dumps(grid)}\n\nResults:\n{numbered}"
     )
     reply, failure = _advice(
-        llm, "clerk", "nano", CLERK_SYS, user, mock=lambda: "{}", reasoning=False
+        llm,
+        "clerk",
+        "nano",
+        CLERK_SYS,
+        user,
+        mock=lambda: _offline_triage(found, note),
+        reasoning=False,
     )
     if reply is None:
         summary = f"The prior-art triage failed ({failure}). The top results are listed."
@@ -493,8 +536,15 @@ def triage_prior_art(llm: LLM, spec: dict, hits: list[dict], note: str | None = 
             continue
         value = _parameter_value(item.get("value"))
         source = _result_number(item.get("source"), len(found))
-        if value is not None and source is not None:
-            published[name] = {"value": value, "source": _cited(found[source])}
+        if value is None or source is None:
+            continue
+        if not _quoted(item.get("quote"), found[source].get("content", "")):
+            continue  # the result doesn't say that, so the value is the model's, not a paper's
+        published[name] = {
+            "value": value,
+            "source": _cited(found[source]),
+            "quote": " ".join(str(item["quote"]).split()),
+        }
 
     known = reply.get("already_known")
     return {
@@ -532,6 +582,13 @@ walk-forward Sharpe would need to run to show its Sharpe is above zero.
 time_travel reports the harness test that re-runs the strategy on truncated
 history: if it FAILED, the code read the future or could not be shown not to,
 the backtest is meaningless whatever its Sharpe, and that is the headline.
+prior_art_known says whether a web search found this effect already
+published (prior_art_citations names the sources): if true, say so and expect
+the edge to have shrunk since publication, as published anomalies usually do.
+literature_test, when present, is one configuration fixed by a paper before
+this data was seen and tested alone: its p_value is a single pre-registered
+test with no correction for the search, context for your explanation and
+never a reason to change the verdict.
 Reply JSON only:
 {"headline": str, "reasoning": [str, str, str], "what_would_change_my_mind": [str, str]}
 Use only numbers that appear in the evidence. Be direct, no hype."""
@@ -644,24 +701,44 @@ def court_opinion(verdict: str, e: dict) -> dict:
             f"At the Sharpe it earned on unseen data, proving it live would take about {years} "
             "years."
         )
+    reasoning = [
+        f"{e['n_configs']} configurations were tried here. They move in only about "
+        f"{e['distinct_bets_this_trial']:.0f} independent directions, yet luck had about as "
+        f"many chances as {e['luck_equivalent_tries']} independent tries: zero-edge versions "
+        f"typically reach a best Sharpe of {e['luck_sharpe_annual']:.2f}.{memory}",
+        f"Luck alone does as well as the winner in {e['p_value']:.1%} of bootstrap "
+        f"resamples (the Reality Check's {fmt_p(e['p_value'])}). {proof}",
+        f"The best choice on past data lost money on unseen data in "
+        f"{e['prob_oos_loss']:.0%} of train/test splits, and chosen on past data and traded "
+        f"on the next period its Sharpe is {e['walk_forward_sharpe']:.2f}. (It ranked in the "
+        f"bottom half on unseen data in {e['pbo']:.0%} of splits, a measure of how much the "
+        "exact parameter choice was luck.)",
+    ]
+    if e.get("literature_test"):
+        reasoning.append(literature_line(e["literature_test"], e.get("prior_art_known")))
     return {
         "headline": f"{verdict}: the best backtest Sharpe of {e['best_sharpe_annual']:.2f} "
         f"against {e['luck_sharpe_annual']:.2f} from luck alone.",
-        "reasoning": [
-            f"{e['n_configs']} configurations were tried here. They move in only about "
-            f"{e['distinct_bets_this_trial']:.0f} independent directions, yet luck had about as "
-            f"many chances as {e['luck_equivalent_tries']} independent tries: zero-edge versions "
-            f"typically reach a best Sharpe of {e['luck_sharpe_annual']:.2f}.{memory}",
-            f"Luck alone does as well as the winner in {e['p_value']:.1%} of bootstrap "
-            f"resamples (the Reality Check's {fmt_p(e['p_value'])}). {proof}",
-            f"The best choice on past data lost money on unseen data in "
-            f"{e['prob_oos_loss']:.0%} of train/test splits, and chosen on past data and traded "
-            f"on the next period its Sharpe is {e['walk_forward_sharpe']:.2f}. (It ranked in the "
-            f"bottom half on unseen data in {e['pbo']:.0%} of splits, a measure of how much the "
-            "exact parameter choice was luck.)",
-        ],
+        "reasoning": reasoning,
         "what_would_change_my_mind": [
             "Committing to one configuration and passing the sealed evidence test",
             "Similar results on assets or years it has never seen",
         ],
     }
+
+
+def literature_line(test: dict, known: bool | None) -> str:
+    """The literature's own configuration, tested alone, in one sentence of the opinion."""
+    named = ", ".join(f"{name} {value:g}" for name, value in test["published"].items())
+    if test.get("n_configs", 1) == 1:
+        how = "tested on its own as a single test fixed before this data"
+    else:
+        how = (
+            f"the best of the {test['n_configs']} configurations consistent with it, judged by "
+            "a Reality Check over those alone"
+        )
+    shrunk = " The effect is already published, so expect its edge to have shrunk." if known else ""
+    return (
+        f"The sources name {named} ({test['source']}); {how}, it earned a Sharpe of "
+        f"{test['sharpe_annual']:.2f} ({fmt_p(test['p_value'])}).{shrunk}"
+    )

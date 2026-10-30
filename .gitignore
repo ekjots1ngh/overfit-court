@@ -7,3 +7,4 @@ __pycache__/
 .overfit_court_sandbox_image
 /fishing_results.csv
 /*.csv
+.claude/
